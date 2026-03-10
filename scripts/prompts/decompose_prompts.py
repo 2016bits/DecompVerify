@@ -1,3 +1,5 @@
+import json
+
 decompose_instruct = """You are an expert fact-checking planner.
 
 Decompose the claim into:
@@ -136,6 +138,64 @@ Examples:
   }
 """
 
+decompose_repair_prompt = """You are an expert checker for multi-hop fact-checking plans.
+
+You are given:
+1. a claim
+2. a decomposition plan with atomic facts and constraints
+3. detected issues in the decomposition
+
+Your task:
+Repair the decomposition so that it is faithful to the claim and suitable for step-wise verification.
+
+What to check:
+1. Each atomic fact must faithfully reflect the claim.
+2. Each atomic fact must contain exactly one main relation.
+3. Dependencies must represent real answer flow:
+   - fact B depends on fact A only if fact B needs a variable resolved by fact A.
+4. Relative clauses or modifiers must attach to the correct entity.
+5. Do not introduce facts that change the meaning of the claim.
+6. Remove redundant or incorrect atomic facts.
+7. Keep the schema unchanged.
+8. Return JSON only.
+
+claim:
+[CLAIM]
+
+current decomposition:
+[DECOMPOSITION]
+
+issues:
+[ISSUES]
+
+Return JSON only in this schema:
+{{
+  "claim": "...",
+  "atomic_facts": [
+    {{
+      "id": "f1",
+      "subject": "...",
+      "predicate": "...",
+      "object": "...",
+      "role": "bridge|verify|anchor",
+      "depends_on": []
+    }}
+  ],
+  "constraints": [
+    {{
+      "type": "negation|comparison|time|quantity",
+      "target_facts": ["f1"],
+      "operator": "not|before|after|earlier_than|later_than|>|<|=|>=|<=",
+      "value": ""
+    }}
+  ]
+}}
+"""
+
 def get_decompose_prompt(claim):
     prompt = decompose_instruct + decompose_examples + f'\nClaim: "{claim}"\nDecomposition:'
+    return prompt
+
+def get_repair_prompt(claim, decomposition, issues):
+    prompt = decompose_repair_prompt.replace('[CLAIM]', claim).replace('[DECOMPOSITION]', json.dumps(decomposition, indent=4)).replace('[ISSUES]', '\n'.join(f'- {issue}' for issue in issues))
     return prompt

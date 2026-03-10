@@ -7,7 +7,7 @@ from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 
-from scripts.prompts.decompose_prompts import get_decompose_prompt
+from scripts.prompts.decompose_prompts import get_decompose_prompt, get_repair_prompt
 
 def llm(input, port='8370'):
     openai_api_key = "EMPTY"
@@ -170,6 +170,28 @@ def normalize_decomposition(parsed, claim):
     }
     return result
 
+def detect_cycle(atomic_facts):
+    fact_map = {fact["id"]: fact for fact in atomic_facts}
+    visited = {}
+    path = set()
+
+    def dfs(fid):
+        if fid in path:
+            return True
+        if visited.get(fid, False):
+            return False
+        visited[fid] = True
+        path.add(fid)
+        for dep in fact_map[fid].get("depends_on", []):
+            if dep in fact_map and dfs(dep):
+                return True
+        path.remove(fid)
+        return False
+
+    for fid in fact_map:
+        if dfs(fid):
+            return True
+    return False
 
 def validate_decomposition(result):
     """
@@ -211,6 +233,96 @@ def validate_decomposition(result):
 
     return True
 
+def extract_variables(text):
+    if not isinstance(text, str):
+        return set()
+    return set(re.findall(r"\?[A-Za-z_][A-Za-z0-9_]*", text))
+
+
+def fact_variables(fact):
+    return extract_variables(fact.get("subject", "")) | extract_variables(fact.get("object", ""))
+
+
+def has_real_dependency(src_fact, tgt_fact):
+    """
+    若 tgt 依赖 src，通常应该存在变量流：
+    src 中引入的变量，在 tgt 中被使用。
+    """
+    src_vars = fact_variables(src_fact)
+    tgt_vars = fact_variables(tgt_fact)
+    return len(src_vars & tgt_vars) > 0
+
+
+def find_suspicious_issues(decomposition):
+    issues = []
+    atomic_facts = decomposition.get("atomic_facts", [])
+    constraints = decomposition.get("constraints", [])
+
+    if not atomic_facts:
+        issues.append("atomic_facts is empty")
+        return issues
+
+    fact_map = {fact["id"]: fact for fact in atomic_facts}
+
+    # 1. depends_on 但没有变量流
+    for fact in atomic_facts:
+        for dep_id in fact.get("depends_on", []):
+            if dep_id not in fact_map:
+                issues.append(
+                    f"Invalid dependency: {fact['id']} depends on missing fact {dep_id}"
+                )
+                continue
+            src = fact_map[dep_id]
+            if not has_real_dependency(src, fact):
+                issues.append(
+                    f"Suspicious dependency: {fact['id']} depends on {dep_id} but no shared variable found"
+                )
+
+    # 2. bridge fact 不含变量
+    for fact in atomic_facts:
+        if fact.get("role") == "bridge":
+            vars_in_fact = fact_variables(fact)
+            if len(vars_in_fact) == 0:
+                issues.append(f"Bridge fact {fact['id']} contains no variable")
+
+    # 3. 变量只出现一次，通常说明链没形成
+    var_count = {}
+    for fact in atomic_facts:
+        for v in fact_variables(fact):
+            var_count[v] = var_count.get(v, 0) + 1
+    for v, c in var_count.items():
+        if c == 1:
+            issues.append(f"Variable {v} appears only once")
+
+    # 4. anchor 不带变量通常可疑
+    for fact in atomic_facts:
+        if fact.get("role") == "anchor":
+            vars_in_fact = fact_variables(fact)
+            if len(vars_in_fact) == 0:
+                issues.append(f"Anchor fact {fact['id']} contains no variable")
+
+    # 5. 约束没锚到事实
+    fact_ids = {fact["id"] for fact in atomic_facts}
+    for c in constraints:
+        for fid in c.get("target_facts", []):
+            if fid not in fact_ids:
+                issues.append(f"Constraint references missing fact {fid}")
+
+    # 6. 循环依赖
+    if detect_cycle(atomic_facts):
+        issues.append("Cyclic dependencies detected")
+
+    return issues
+
+
+def repair_decomposition(claim, decomposition, issues, port):
+    prompt = get_repair_prompt(claim, decomposition, issues)
+    output = llm(prompt, port)
+    parsed = parse_items(output)
+    repaired = normalize_decomposition(parsed, claim)
+    validate_decomposition(repaired)
+    return repaired
+
 def decompose_text(claim, port):
     prompt = get_decompose_prompt(claim)
     
@@ -223,7 +335,27 @@ def decompose_text(claim, port):
             parsed = parse_items(output)
             result = normalize_decomposition(parsed, claim)
             validate_decomposition(result)
-            return result
+            
+            issues = find_suspicious_issues(result)
+            if issues:
+                repair_count = 0
+                repaired = result
+                while repair_count < 2:
+                    try:
+                        repaired = repair_decomposition(claim, repaired, issues, port)
+                        new_issues = find_suspicious_issues(repaired)
+                        if not new_issues:
+                            return repaired, issues, True
+                        repaired = repaired
+                        issues = new_issues
+                        repair_count += 1
+                    except Exception as e:
+                        print(f"[Repair Retry {repair_count + 1}/2] Error during repair: {e}")
+                        repair_count += 1
+                return repaired, issues, True
+            
+            return result, [], False
+        
         except Exception as e:
             last_error = e
             print(f"[Retry {infer_count + 1}/3] Error during decomposition: {e}")
@@ -234,11 +366,11 @@ def decompose_text(claim, port):
         "claim": claim,
         "atomic_facts": [],
         "constraints": []
-    }
+    }, [f"decomposition_failed: {str(last_error)}"], False
 
 def process_data_item(data, port):
     claim = data['claim']
-    atomic_facts = decompose_text(claim, port)
+    atomic_facts, issues, is_repaired = decompose_text(claim, port)
     
     return {
         'id': data['id'],
@@ -246,13 +378,13 @@ def process_data_item(data, port):
         'gold_evidence': data['gold_evidence'],
         'num_hops': data['num_hops'],
         'label': data['label'],
-        'atomic_facts': atomic_facts
+        'atomic_facts': atomic_facts,
+        'issues': issues,
+        'is_repaired': is_repaired
     }
 
 def main(args):
     in_path = args.in_path.replace('[DATA]', args.dataset).replace('[TYPE]', f'{args.data_type}')
-    with open(in_path, 'r') as f:
-        dataset = json.load(f)
     
     with open(in_path, 'r') as f:
         raws = json.load(f)
@@ -295,7 +427,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=str, default='8370', help='Port for LLM API')
     
     parser.add_argument('--in_path', type=str, default='./data/[DATA]/converted_data/[TYPE].json', help='Input path template')
-    parser.add_argument('--out_path', type=str, default='./data/[DATA]/plan2/[TYPE]_[CLASS]_decomposed_[T]_[S]_[E].json', help='Output path template')
+    parser.add_argument('--out_path', type=str, default='./data/[DATA]/plan2/[TYPE]_[CLASS]_decomposed_[T][S]_[E].json', help='Output path template')
     parser.add_argument('--t', type=str, default='')
     
     args = parser.parse_args()
