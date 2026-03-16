@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=7
 python -O -u -m vllm.entrypoints.openai.api_server \
         --host=127.0.0.1 \
         --port=8373 \
