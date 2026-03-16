@@ -161,6 +161,7 @@ def main(args):
         .replace("[TYPE]", args.data_type)
         .replace("[CLASS]", args.class_num)
         .replace("[T]", args.t)
+        .replace("[PLAN]", args.plan)
     )
     path2 = (
         args.in_path2
@@ -168,6 +169,7 @@ def main(args):
         .replace("[TYPE]", args.data_type)
         .replace("[CLASS]", args.class_num)
         .replace("[T]", args.t)
+        .replace("[PLAN]", args.plan)
     )
 
     data1 = load_json(path1)
@@ -189,6 +191,7 @@ def main(args):
             .replace("[TYPE]", args.data_type)
             .replace("[CLASS]", args.class_num)
             .replace("[T]", args.t)
+            .replace("[PLAN]", args.plan)
         )
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=4, ensure_ascii=False)
@@ -206,20 +209,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--in_path1",
         type=str,
-        default="./data/[DATA]/plan2/[TYPE]_[CLASS]_final_[T]0_2000.json",
+        default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_final_[T]0_2000.json",
         help="First input file"
     )
     parser.add_argument(
         "--in_path2",
         type=str,
-        default="./data/[DATA]/plan2/[TYPE]_[CLASS]_final_[T]2000_4000.json",
+        default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_final_[T]2000_4000.json",
         help="Second input file"
     )
     parser.add_argument(
         "--out_path",
         type=str,
-        default="./data/[DATA]/plan2/[TYPE]_[CLASS]_eval_by_hop[T].json",
+        default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_eval_by_hop[T].json",
         help="Output report file"
+    )
+    parser.add_argument(
+        "--plan",
+        type=str,
+        default="plan2.1",
+        help="Which plan version to use for path templates"
     )
 
     args = parser.parse_args()
