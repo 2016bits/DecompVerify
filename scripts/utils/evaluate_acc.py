@@ -155,26 +155,37 @@ def print_report(report):
 
 
 def main(args):
-    path1 = (
-        args.in_path1
-        .replace("[DATA]", args.dataset)
-        .replace("[TYPE]", args.data_type)
-        .replace("[CLASS]", args.class_num)
-        .replace("[T]", args.t)
-        .replace("[PLAN]", args.plan)
-    )
-    path2 = (
-        args.in_path2
-        .replace("[DATA]", args.dataset)
-        .replace("[TYPE]", args.data_type)
-        .replace("[CLASS]", args.class_num)
-        .replace("[T]", args.t)
-        .replace("[PLAN]", args.plan)
-    )
+    if args.results_file_num == 2:
+        path1 = (
+            args.in_path1
+            .replace("[DATA]", args.dataset)
+            .replace("[TYPE]", args.data_type)
+            .replace("[CLASS]", args.class_num)
+            .replace("[T]", args.t)
+            .replace("[PLAN]", args.plan)
+        )
+        path2 = (
+            args.in_path2
+            .replace("[DATA]", args.dataset)
+            .replace("[TYPE]", args.data_type)
+            .replace("[CLASS]", args.class_num)
+            .replace("[T]", args.t)
+            .replace("[PLAN]", args.plan)
+        )
 
-    data1 = load_json(path1)
-    data2 = load_json(path2)
-    data = data1 + data2
+        data1 = load_json(path1)
+        data2 = load_json(path2)
+        data = data1 + data2
+    elif args.results_file_num == 1:
+        path = (
+            args.in_path
+            .replace("[DATA]", args.dataset)
+            .replace("[TYPE]", args.data_type)
+            .replace("[CLASS]", args.class_num)
+            .replace("[T]", args.t)
+            .replace("[PLAN]", args.plan)
+        )
+        data = load_json(path)
 
     report = evaluate(
         data=data,
@@ -217,6 +228,19 @@ if __name__ == "__main__":
         type=str,
         default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_final_[T]2000_4000.json",
         help="Second input file"
+    )
+    parser.add_argument(
+        "--in_path",
+        type=str,
+        default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_final_[T].json",
+        help="Input file when results_file_num=1"
+    )
+    parser.add_argument(
+        "--results_file_num",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help="Number of result files to read (1 or 2)"
     )
     parser.add_argument(
         "--out_path",
