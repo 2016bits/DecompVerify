@@ -364,6 +364,7 @@ def main(args):
         .replace("[T]", args.t)
         .replace("[S]", str(args.start))
         .replace("[E]", str(args.end))
+        .replace("[PLAN]", args.plan)
     )
 
     with open(in_path, "r", encoding="utf-8") as f:
@@ -421,6 +422,7 @@ def main(args):
         .replace("[T]", args.t)
         .replace("[S]", str(args.start))
         .replace("[E]", str(args.end))
+        .replace("[PLAN]", args.plan)
     )
 
     out_dir = os.path.dirname(out_path)
@@ -446,15 +448,16 @@ if __name__ == "__main__":
     parser.add_argument(
         '--in_path',
         type=str,
-        default='./data/[DATA]/plan2/[TYPE]_[CLASS]_question_[T][S]_[E].json',
+        default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_question_[T][S]_[E].json',
         help='Input path template'
     )
     parser.add_argument(
         '--out_path',
         type=str,
-        default='./data/[DATA]/plan2/[TYPE]_[CLASS]_answer_[T][S]_[E].json',
+        default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_answer_[T][S]_[E].json',
         help='Output path template'
     )
+    parser.add_argument('--plan', type=str, default='plan3', help='Plan name to distinguish different question generation strategies')
     parser.add_argument('--t', type=str, default='')
 
     args = parser.parse_args()

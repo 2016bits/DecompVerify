@@ -338,21 +338,21 @@ def decompose_text(claim, port):
             
             issues = find_suspicious_issues(result)
             if issues:
-                repair_count = 0
-                repaired = result
-                while repair_count < 2:
-                    try:
-                        repaired = repair_decomposition(claim, repaired, issues, port)
-                        new_issues = find_suspicious_issues(repaired)
-                        if not new_issues:
-                            return repaired, issues, True
-                        repaired = repaired
-                        issues = new_issues
-                        repair_count += 1
-                    except Exception as e:
-                        print(f"[Repair Retry {repair_count + 1}/2] Error during repair: {e}")
-                        repair_count += 1
-                return repaired, issues, True
+                # repair_count = 0
+                # repaired = result
+                # while repair_count < 2:
+                #     try:
+                #         repaired = repair_decomposition(claim, repaired, issues, port)
+                #         new_issues = find_suspicious_issues(repaired)
+                #         if not new_issues:
+                #             return repaired, issues, True
+                #         repaired = repaired
+                #         issues = new_issues
+                #         repair_count += 1
+                #     except Exception as e:
+                #         print(f"[Repair Retry {repair_count + 1}/2] Error during repair: {e}")
+                #         repair_count += 1
+                return result, issues, True
             
             return result, [], False
         
@@ -402,7 +402,7 @@ def main(args):
     
     partial_func = partial(process_data_item, port=args.port)
     results = []
-    with ThreadPoolExecutor(max_workers=16) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         features = [executor.submit(partial_func, data) for data in dataset]
         for f in tqdm(as_completed(features), total=len(features)):
             try:
@@ -412,7 +412,7 @@ def main(args):
                 print(e)
                 continue
     
-    out_path = args.out_path.replace('[DATA]', args.dataset).replace('[TYPE]', args.data_type).replace('[CLASS]', args.class_num).replace('[T]', args.t).replace('[S]', str(args.start)).replace('[E]', str(args.end))
+    out_path = args.out_path.replace('[DATA]', args.dataset).replace('[TYPE]', args.data_type).replace('[CLASS]', args.class_num).replace('[T]', args.t).replace('[S]', str(args.start)).replace('[E]', str(args.end)).replace('[PLAN]', args.plan)
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=4)
     print(f"Saved to {out_path}")
@@ -427,7 +427,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=str, default='8370', help='Port for LLM API')
     
     parser.add_argument('--in_path', type=str, default='./data/[DATA]/converted_data/[TYPE].json', help='Input path template')
-    parser.add_argument('--out_path', type=str, default='./data/[DATA]/plan2/[TYPE]_[CLASS]_decomposed_[T][S]_[E].json', help='Output path template')
+    parser.add_argument('--out_path', type=str, default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_decomposed_[T][S]_[E].json', help='Output path template')
+    parser.add_argument('--plan', type=str, default='plan3')
     parser.add_argument('--t', type=str, default='')
     
     args = parser.parse_args()

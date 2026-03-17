@@ -603,6 +603,7 @@ def main(args):
         .replace("[T]", args.t)
         .replace("[S]", str(args.start))
         .replace("[E]", str(args.end))
+        .replace("[PLAN]", args.plan)
     )
 
     with open(in_path, "r", encoding="utf-8") as f:
@@ -656,7 +657,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--in_path',
         type=str,
-        default='./data/[DATA]/plan2/[TYPE]_[CLASS]_fact_verify_[T][S]_[E].json',
+        default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_fact_verify_[T][S]_[E].json',
         help='Input path template'
     )
     parser.add_argument(
@@ -666,7 +667,7 @@ if __name__ == "__main__":
         help='Output path template'
     )
     
-    parser.add_argument('--plan', type=str, default='plan2.1', help='Which plan version to use for aggregation logic')
+    parser.add_argument('--plan', type=str, default='plan3', help='Which plan version to use for aggregation logic')
     parser.add_argument('--t', type=str, default='')
     parser.add_argument('--support_threshold', type=float, default=1.6)
     parser.add_argument('--refute_threshold', type=float, default=-0.8)

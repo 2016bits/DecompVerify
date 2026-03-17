@@ -9,10 +9,18 @@ Decompose the claim into:
 Requirements:
 - Do not extract keywords.
 - Each atomic fact must contain exactly one main relation.
-- Atomic facts must be minimal and independently verifiable.
-- If an intermediate entity is needed, use a variable such as ?x.
-- Use depends_on to show dependencies between atomic facts.
-- Put negation, comparison, time, and quantity into constraints.
+- Atomic facts must be minimal, faithful to the claim, and independently verifiable.
+- Prefer the fewest atomic facts that still preserve the claim's meaning.
+- Do not over-decompose.
+- If an intermediate entity is needed for later verification, use a variable such as ?x.
+- Use depends_on only when a later fact truly needs a variable resolved by an earlier fact.
+- Do not add a bridge fact unless it is necessary for a later verify fact or constraint.
+- Put negation, comparison, time, and quantity into constraints whenever possible.
+- Keep attachment scope correct:
+  - relative clauses
+  - prepositional phrases
+  - appositives
+  - temporal modifiers
 - Do not add external knowledge.
 - Return JSON only.
 
@@ -50,6 +58,20 @@ Examples:
         "subject": "Robert J. O'Neill",
         "predicate": "born on",
         "object": "April 10, 1976",
+        "role": "verify",
+        "depends_on": []
+      }
+    ],
+    "constraints": []
+  },
+  {
+    "claim": "The capital of France is Paris.",
+    "atomic_facts": [
+      {
+        "id": "f1",
+        "subject": "the capital of France",
+        "predicate": "is",
+        "object": "Paris",
         "role": "verify",
         "depends_on": []
       }
@@ -156,8 +178,11 @@ What to check:
 4. Relative clauses or modifiers must attach to the correct entity.
 5. Do not introduce facts that change the meaning of the claim.
 6. Remove redundant or incorrect atomic facts.
-7. Keep the schema unchanged.
-8. Return JSON only.
+7. Prefer fewer atomic facts when multiple decompositions are possible.
+8. Keep the main semantic relation of the claim intact; do not weaken it into loosely related facts.
+9. A bridge fact is valid only if it resolves a variable used later by a verify fact or constraint.
+10. Keep the schema unchanged.
+11. Return JSON only.
 
 claim:
 [CLAIM]
