@@ -603,6 +603,7 @@ def main(args):
         .replace("[T]", args.t)
         .replace("[S]", str(args.start))
         .replace("[E]", str(args.end))
+        .replace("[PLAN]", args.plan)
     )
 
     with open(in_path, "r", encoding="utf-8") as f:
@@ -651,12 +652,12 @@ if __name__ == "__main__":
     parser.add_argument('--data_type', type=str, default='dev', help='Data type: train/dev/test')
     parser.add_argument('--class_num', type=str, default='2', help='Number of classes: 2/3')
     parser.add_argument('--start', type=int, default=0, help='Start index')
-    parser.add_argument('--end', type=int, default=2000, help='End index')
+    parser.add_argument('--end', type=int, default=200, help='End index')
 
     parser.add_argument(
         '--in_path',
         type=str,
-        default='./data/[DATA]/plan2/[TYPE]_[CLASS]_fact_verify_[T][S]_[E].json',
+        default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_fact_verify_[T][S]_[E].json',
         help='Input path template'
     )
     parser.add_argument(
