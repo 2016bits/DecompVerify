@@ -26,7 +26,7 @@ def build_client_and_model(plan, port='8370'):
     plan = (plan or "").lower()
 
     # 1) 本地 OpenAI-compatible 服务
-    if plan in {"local", "localhost", "vllm"}:
+    if plan in {"local", "localhost", "vllm"} or "plan" in plan:
         client = OpenAI(
             api_key="EMPTY",
             base_url=f"http://localhost:{port}/v1"
@@ -631,14 +631,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='HOVER_subset', help='Dataset name')
+    parser.add_argument('--dataset', type=str, default='HOVER', help='Dataset name')
     parser.add_argument('--data_type', type=str, default='dev', help='Data type: train/dev/test')
     parser.add_argument('--class_num', type=str, default='2', help='Number of classes: 2/3')
     parser.add_argument('--start', type=int, default=0, help='Start index')
     parser.add_argument('--end', type=int, default=200, help='End index')
     parser.add_argument('--port', type=str, default='8370', help='Port for local LLM API')
     parser.add_argument('--max_workers', type=int, default=8, help='Number of threads')
-    parser.add_argument('--plan', type=str, default='local', help='LLM plan: local/scnet/iflow/azure')
+    parser.add_argument('--plan', type=str, default='plan3.3', help='LLM plan: local/scnet/iflow/azure')
 
     parser.add_argument(
         '--in_path',

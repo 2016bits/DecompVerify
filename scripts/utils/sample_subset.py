@@ -5,6 +5,11 @@ import os
 from collections import defaultdict, Counter
 
 
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def normalize_label(label):
     s = str(label).strip().lower()
     if s in {"supports", "support", "supported"}:
@@ -179,13 +184,21 @@ def stratified_sample(data, sample_size, seed=42, balance_labels=True):
 
 
 def main(args):
-    with open(args.input_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = load_json(args.input_path)
+    summarize(data, title="Original dataset")
+
+    if args.exclude_path:
+        excluded = load_json(args.exclude_path)
+        excluded_ids = {x["id"] for x in excluded}
+        original_size = len(data)
+        data = [x for x in data if x["id"] not in excluded_ids]
+        removed_count = original_size - len(data)
+
+        print(f"Excluded {removed_count} items using: {args.exclude_path}")
+        summarize(data, title="Remaining pool after exclusion")
 
     if args.sample_size > len(data):
         raise ValueError(f"sample_size={args.sample_size} > dataset size={len(data)}")
-
-    summarize(data, title="Original dataset")
 
     subset = stratified_sample(
         data=data,
@@ -232,6 +245,12 @@ if __name__ == "__main__":
         "--balance_labels",
         action="store_true",
         help="Whether to force supports/refutes balance"
+    )
+    parser.add_argument(
+        "--exclude_path",
+        type=str,
+        default=None,
+        help="Optional JSON file whose ids will be excluded before sampling"
     )
 
     args = parser.parse_args()

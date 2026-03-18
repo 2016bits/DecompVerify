@@ -24,7 +24,7 @@ def build_client_and_model(plan, port='8370'):
     plan = (plan or "").lower()
 
     # 1) 本地 OpenAI-compatible 服务
-    if plan in {"local", "localhost", "vllm"}:
+    if plan in {"local", "localhost", "vllm"} or "plan" in plan:
         client = OpenAI(
             api_key="EMPTY",
             base_url=f"http://localhost:{port}/v1"
