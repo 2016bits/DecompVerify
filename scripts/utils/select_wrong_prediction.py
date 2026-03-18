@@ -1,18 +1,69 @@
 import json
+import argparse
+import os
 
-plan = "plan2.1"
 
-in_path = "./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_final_.json"
-in_path = in_path.replace("[DATA]", "HOVER_subset").replace("[PLAN]", plan).replace("[TYPE]", "dev").replace("[CLASS]", "2")
+def build_path(template, args):
+    path = template
+    path = path.replace("[DATA]", args.dataset)
+    path = path.replace("[PLAN]", args.plan)
+    path = path.replace("[TYPE]", args.data_type)
+    path = path.replace("[CLASS]", args.class_num)
+    path = path.replace("[T]", args.t)
+    path = path.replace("[S]", str(args.start))
+    path = path.replace("[E]", str(args.end))
+    return path
 
-with open(in_path, 'r') as f:
-    dataset = json.load(f)
 
-wrong_predictions = [item for item in dataset if item['label'] != item['predicted_label']]
+def main(args):
+    in_path = build_path(args.in_path, args)
+    out_path = build_path(args.out_path, args)
 
-out_path = "./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_wrong_prediction.json"
-out_path = out_path.replace("[DATA]", "HOVER_subset").replace("[PLAN]", plan).replace("[TYPE]", "dev").replace("[CLASS]", "2")
+    print(f"Loading from: {in_path}")
 
-with open(out_path, 'w') as f:
-    json.dump(wrong_predictions, f, indent=4)
-print(f"Saved to {out_path}, total {len(wrong_predictions)} items.")
+    with open(in_path, 'r') as f:
+        dataset = json.load(f)
+
+    # 截取子集（如果需要）
+    dataset = dataset[args.start:args.end]
+
+    wrong_predictions = [
+        item for item in dataset
+        if item.get('label') != item.get('predicted_label')
+    ]
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    with open(out_path, 'w') as f:
+        json.dump(wrong_predictions, f, indent=4)
+
+    print(f"Saved to {out_path}, total {len(wrong_predictions)} items.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--dataset', type=str, default='HOVER_subset', help='Dataset name')
+    parser.add_argument('--data_type', type=str, default='dev', help='Data type: train/dev/test')
+    parser.add_argument('--class_num', type=str, default='2', help='Number of classes: 2/3')
+    parser.add_argument('--start', type=int, default=0, help='Start index')
+    parser.add_argument('--end', type=int, default=200, help='End index')
+
+    parser.add_argument(
+        '--in_path',
+        type=str,
+        default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_final_[S]_[E].json',
+        help='Input path template'
+    )
+    parser.add_argument(
+        '--out_path',
+        type=str,
+        default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_wrong_prediction_[S]_[E].json',
+        help='Output path template'
+    )
+
+    parser.add_argument('--plan', type=str, default='azure', help='Which plan version to use')
+    parser.add_argument('--t', type=str, default='')
+
+    args = parser.parse_args()
+    main(args)
