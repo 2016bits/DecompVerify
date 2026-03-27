@@ -26,7 +26,7 @@ def build_client_and_model(plan, port='8370'):
     plan = (plan or "").lower()
 
     # 1) 本地 OpenAI-compatible 服务
-    if plan in {"local", "localhost", "vllm"} or "plan" in plan:
+    if plan in {"local", "localhost", "vllm"} or plan.startswith("plan"):
         client = OpenAI(
             api_key="EMPTY",
             base_url=f"http://localhost:{port}/v1"
@@ -90,7 +90,19 @@ def build_client_and_model(plan, port='8370'):
         max_tokens = 512
         temperature = 0.7
         return client, model, system_prompt, extra_body, max_tokens, temperature
-
+    
+    elif plan.startswith("qwen_plan"):
+        client = OpenAI(
+            api_key="EMPTY",
+            base_url=f"http://localhost:{port}/v1"
+        )
+        model = "gpt-4o"
+        system_prompt = "You are a helpful assistant."
+        extra_body = None
+        max_tokens = None
+        temperature = 0.7
+        return client, model, system_prompt, extra_body, max_tokens, temperature
+    
     else:
         raise ValueError(
             f"Unsupported plan: {plan}. "
