@@ -1,42 +1,41 @@
 import json
 
+decompose_instruct = """You are an expert fact decomposition assistant for multi-hop fact verification.
 
-decompose_instruct = """
-You are an expert planner for multi-hop fact verification.
+Your task:
+Decompose a claim into atomic facts.
 
-Task:
-Decompose a claim into minimal atomic facts for step-wise verification.
+Requirements:
+1. Each atomic fact should express only ONE core relation.
+2. Use rely_on to represent dependency between facts.
+3. Add a constraint field with:
+   - negation: true or null
+   - time: list[str]
+   - quantity: list[str]
+4. Add a critical field for each atomic fact:
+   - critical = true if this fact is essential for determining the final truth of the claim
+   - critical = false otherwise
 
-Core principle:
-Each atomic fact must express exactly ONE core verifiable relation.
-
-Allowed decomposition types:
-- simple
-- coordinated
-- nested
-- quantified_or_comparative
-
-Constraint policy:
-Only keep these three constraint types:
+Mark a fact as critical=true when it involves one of the following:
 - negation
-- time
-- quantity
+- explicit time / quantity constraints
+- comparison / equality / inequality
+- superlative / ordinal / ranking
+- key location or identity constraints
+- key modifier that can flip the final label
+Examples:
+- "largest", "smallest", "first", "same", "different"
+- "born in Norfolk"
+- "shown on Sky Living"
+- "the same director"
+- "not the same director"
 
-Important output rules:
-- Return VALID JSON only.
-- Do not output markdown.
-- Do not output explanations.
-- Use only this schema.
-- Use ids f1, f2, f3, ...
-- rely_on may only contain earlier fact ids.
-- negation must be true or null.
-- time must be a list.
-- quantity must be a list.
+Output JSON only.
 
 Output schema:
 {
   "claim": "...",
-  "decomposition_type": "simple",
+  "decomposition_type": "simple|coordinated|nested|comparison",
   "atomic_facts": [
     {
       "id": "f1",
@@ -46,148 +45,185 @@ Output schema:
         "negation": null,
         "time": [],
         "quantity": []
-      }
+      },
+      "critical": true
     }
   ]
 }
 """
 
+decompose_examples = """Example 1:
+Claim:
+"Cotton Mather was politically influential in New England, the largest geographical region in the US."
 
-decompose_examples = r'''
-Example 1:
+Output:
 {
-  "claim": "Marie Curie was born in Warsaw and won two Nobel Prizes.",
-  "decomposition_type": "coordinated",
-  "atomic_facts": [
-    {
-      "id": "f1",
-      "text": "Marie Curie was born in Warsaw",
-      "rely_on": [],
-      "constraint": {
-        "negation": null,
-        "time": [],
-        "quantity": []
-      }
-    },
-    {
-      "id": "f2",
-      "text": "Marie Curie won Nobel Prizes",
-      "rely_on": [],
-      "constraint": {
-        "negation": null,
-        "time": [],
-        "quantity": ["two"]
-      }
-    }
-  ]
-}
-
-Example 2:
-{
-  "claim": "The director of the film starring Tom Hanks was born in California.",
+  "claim": "Cotton Mather was politically influential in New England, the largest geographical region in the US.",
   "decomposition_type": "nested",
   "atomic_facts": [
     {
       "id": "f1",
-      "text": "Tom Hanks starred in ?film",
+      "text": "Cotton Mather was politically influential in New England",
       "rely_on": [],
       "constraint": {
         "negation": null,
         "time": [],
         "quantity": []
-      }
+      },
+      "critical": false
     },
     {
       "id": "f2",
-      "text": "?film was directed by ?director",
-      "rely_on": ["f1"],
+      "text": "New England is a geographical region in the US",
+      "rely_on": [],
       "constraint": {
         "negation": null,
         "time": [],
         "quantity": []
-      }
+      },
+      "critical": false
     },
     {
       "id": "f3",
-      "text": "?director was born in California",
+      "text": "New England is the largest geographical region in the US",
       "rely_on": ["f2"],
       "constraint": {
         "negation": null,
         "time": [],
         "quantity": []
-      }
+      },
+      "critical": true
     }
   ]
 }
-'''
 
+Example 2:
+Claim:
+"Toby Williams is a British actor, writer and award-winning stand-up comedian born in Norfolk who has appeared in Trying Again shown on Sky Living."
 
-decompose_repair_prompt = """
-You are an expert checker for multi-hop fact decomposition.
-
-You are given:
-1. a claim
-2. a current decomposition result
-3. detected issues
-
-Repair the decomposition so that it is faithful to the claim and suitable for step-wise verification.
-
-Repair rules:
-- Return VALID JSON only.
-- Do not output markdown.
-- Do not output explanations.
-- Use one of these decomposition types only:
-  - simple
-  - coordinated
-  - nested
-  - quantified_or_comparative
-- Each atomic fact must only contain:
-  - id
-  - text
-  - rely_on
-  - constraint
-- constraint must only contain:
-  - negation
-  - time
-  - quantity
-- negation must be true or null.
-- time must be a list.
-- quantity must be a list.
-- rely_on may only reference earlier fact ids.
-
-claim: [CLAIM]
-current decomposition: [DECOMPOSITION]
-issues:
-[ISSUES]
-
-Return JSON only in this schema:
+Output:
 {
-  "claim": "...",
-  "decomposition_type": "simple",
+  "claim": "Toby Williams is a British actor, writer and award-winning stand-up comedian born in Norfolk who has appeared in Trying Again shown on Sky Living.",
+  "decomposition_type": "nested",
   "atomic_facts": [
     {
       "id": "f1",
-      "text": "...",
+      "text": "Toby Williams is a British actor",
       "rely_on": [],
       "constraint": {
         "negation": null,
         "time": [],
         "quantity": []
-      }
+      },
+      "critical": false
+    },
+    {
+      "id": "f2",
+      "text": "Toby Williams is a writer",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      },
+      "critical": false
+    },
+    {
+      "id": "f3",
+      "text": "Toby Williams is an award-winning stand-up comedian",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      },
+      "critical": false
+    },
+    {
+      "id": "f4",
+      "text": "Toby Williams was born in Norfolk",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      },
+      "critical": true
+    },
+    {
+      "id": "f5",
+      "text": "Toby Williams has appeared in Trying Again",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      },
+      "critical": false
+    },
+    {
+      "id": "f6",
+      "text": "Trying Again was shown on Sky Living",
+      "rely_on": ["f5"],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      },
+      "critical": true
+    }
+  ]
+}
+
+Example 3:
+Claim:
+"The documentaries The Truth According to Wikipedia and the 2015 film co-produced by Mary Anne Franks and Al Jazeera America do not have the same director."
+
+Output:
+{
+  "claim": "The documentaries The Truth According to Wikipedia and the 2015 film co-produced by Mary Anne Franks and Al Jazeera America do not have the same director.",
+  "decomposition_type": "comparison",
+  "atomic_facts": [
+    {
+      "id": "f1",
+      "text": "The Truth According to Wikipedia has a director",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      },
+      "critical": false
+    },
+    {
+      "id": "f2",
+      "text": "The 2015 film co-produced by Mary Anne Franks and Al Jazeera America has a director",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": ["2015"],
+        "quantity": []
+      },
+      "critical": false
+    },
+    {
+      "id": "f3",
+      "text": "The director of The Truth According to Wikipedia is not the same as the director of the 2015 film",
+      "rely_on": ["f1", "f2"],
+      "constraint": {
+        "negation": true,
+        "time": [],
+        "quantity": []
+      },
+      "critical": true
     }
   ]
 }
 """
 
-
 def get_decompose_prompt(claim: str) -> str:
-    return decompose_instruct + "\n" + decompose_examples + f'\nClaim: "{claim}"\nReturn JSON only:'
-
-
-
-def get_repair_prompt(claim, decomposition, issues):
-    return (
-        decompose_repair_prompt.replace('[CLAIM]', claim)
-        .replace('[DECOMPOSITION]', json.dumps(decomposition, indent=2, ensure_ascii=False))
-        .replace('[ISSUES]', '\n'.join(f'- {issue}' for issue in issues))
-    )
+    prompt = decompose_instruct + "\n\n"
+    prompt += decompose_examples + "\n\n"
+    prompt += f'Claim:\n"{claim}"\n\n'
+    prompt += "Return JSON only."
+    return prompt

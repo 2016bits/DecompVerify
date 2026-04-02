@@ -1,5 +1,5 @@
-
 import os
+import math
 import json
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,47 +17,17 @@ def _clean_text(text):
     return " ".join(str(text).split()).strip()
 
 
-def get_role_weight(fact_text: str, rely_on):
-    """
-    Lightweight role approximation for the current minimal schema:
-    - root facts / endpoint factual claims: verify-like
-    - intermediate bound/entity bridge facts: bridge-like
-    """
-    rely_on = rely_on or []
-    fact_text = _clean_text(fact_text).lower()
-
-    bridge_markers = [
-        "has a director",
-        "has a capacity",
-        "was taught by",
-        "is named after",
-        "has a home ground",
-        "there exists an author",
-        "there exists a person",
-        "there is a film",
-        "there is a documentary",
-        "there is an acting academy",
-        "a person is an ambassador",
-        "that person",
-        "that actress",
-        "that animal",
-        "that author",
-        "that composer",
-        "that football club",
-        "that naturalist",
-        "that village",
-    ]
-
-    if any(m in fact_text for m in bridge_markers):
-        return 0.85, "bridge"
-    if not rely_on:
-        return 1.0, "verify"
-    return 0.95, "verify"
+def get_role_weight(item):
+    if item.get("critical", False):
+        return 1.0, "critical"
+    if item.get("rely_on", []):
+        return 0.9, "noncritical_dependent"
+    return 0.95, "noncritical_root"
 
 
 def get_source_weight(item):
     evidence_span = _clean_text(item.get("evidence_span", ""))
-    return 1.0 if evidence_span else 0.85
+    return 1.0 if evidence_span else 0.75
 
 
 def get_confidence(item):
@@ -65,30 +35,32 @@ def get_confidence(item):
     evidence_span = _clean_text(item.get("evidence_span", ""))
     answer_status = item.get("answer_status", "insufficient")
 
-    base = 0.85 if evidence_span else 0.65
+    base = 0.85 if evidence_span else 0.60
     if label == INSUFFICIENT:
         base -= 0.15
-    if answer_status == "insufficient":
+    if answer_status in {"insufficient", "api_error"}:
         base -= 0.10
-    return max(0.3, min(1.0, base))
+    return max(0.30, min(1.0, base))
 
 
 def fact_score(item):
     label = item.get("verification_label", INSUFFICIENT)
-    role_weight, role_name = get_role_weight(item.get("fact_text", ""), item.get("rely_on", []))
+    role_weight, role_name = get_role_weight(item)
     source_weight = get_source_weight(item)
     confidence = get_confidence(item)
 
     if label == SUPPORTED:
         base = 1.0
     elif label == CONTRADICTED:
-        base = -1.25
+        base = -1.5 if item.get("critical", False) else -1.1
     else:
-        base = -0.20
+        base = -0.4 if item.get("critical", False) else -0.15
 
     score = base * role_weight * source_weight * confidence
+
     return {
         "fact_id": item.get("fact_id", ""),
+        "critical": item.get("critical", False),
         "verification_label": label,
         "role": role_name,
         "role_weight": role_weight,
@@ -98,145 +70,145 @@ def fact_score(item):
     }
 
 
-def is_constraint_fact(item):
-    constraint = item.get("constraint", {}) or {}
-    return bool(constraint.get("negation") is True or constraint.get("time") or constraint.get("quantity"))
-
-
-def constraint_score(item):
-    if not is_constraint_fact(item):
-        return None
-
-    label = item.get("verification_label", INSUFFICIENT)
-    if label == SUPPORTED:
-        score = 0.7
-    elif label == CONTRADICTED:
-        score = -1.2
-    else:
-        score = -0.15
-
-    return {
-        "fact_id": item.get("fact_id", ""),
-        "verification_label": label,
-        "constraint_score": score,
-    }
-
-
-def has_hard_contradiction(verifications):
-    for item in verifications:
-        label = item.get("verification_label", INSUFFICIENT)
-        evidence_span = _clean_text(item.get("evidence_span", ""))
-        rely_on = item.get("rely_on", []) or []
-        _, role_name = get_role_weight(item.get("fact_text", ""), rely_on)
-        if label == CONTRADICTED and evidence_span and role_name == "verify":
-            return True, item.get("fact_id", "")
-    return False, None
-
-
-def has_constraint_contradiction(verifications):
-    for item in verifications:
-        if is_constraint_fact(item) and item.get("verification_label") == CONTRADICTED:
-            return True, item.get("fact_id", "")
-    return False, None
-
-
-def aggregate_labels(verifications):
-    per_fact_scores = [fact_score(v) for v in verifications]
-    per_constraint_scores = [constraint_score(v) for v in verifications]
-    per_constraint_scores = [x for x in per_constraint_scores if x is not None]
-
-    fact_total = sum(x["score"] for x in per_fact_scores)
-    constraint_total = sum(x["constraint_score"] for x in per_constraint_scores)
-    total = fact_total + constraint_total
-
-    support_count = sum(1 for v in verifications if v.get("verification_label") == SUPPORTED)
-    contradict_count = sum(1 for v in verifications if v.get("verification_label") == CONTRADICTED)
-    insufficient_count = sum(1 for v in verifications if v.get("verification_label") == INSUFFICIENT)
-
-    hard_flag, hard_fact = has_hard_contradiction(verifications)
-    if hard_flag:
-        return {
-            "final_label": "refutes",
-            "decision_reason": f"Hard contradiction triggered by {hard_fact}.",
-            "fact_total_score": round(fact_total, 4),
-            "constraint_total_score": round(constraint_total, 4),
-            "total_score": round(total, 4),
-            "counts": {
-                "support": support_count,
-                "contradict": contradict_count,
-                "insufficient": insufficient_count,
-            },
-            "per_fact_scores": per_fact_scores,
-            "per_constraint_scores": per_constraint_scores,
-        }
-
-    cflag, c_fact = has_constraint_contradiction(verifications)
-    if cflag:
-        return {
-            "final_label": "refutes",
-            "decision_reason": f"Constraint contradiction triggered by {c_fact}.",
-            "fact_total_score": round(fact_total, 4),
-            "constraint_total_score": round(constraint_total, 4),
-            "total_score": round(total, 4),
-            "counts": {
-                "support": support_count,
-                "contradict": contradict_count,
-                "insufficient": insufficient_count,
-            },
-            "per_fact_scores": per_fact_scores,
-            "per_constraint_scores": per_constraint_scores,
-        }
-
-    if total <= -0.8:
-        final = "refutes"
-        reason = "Total score below contradiction threshold."
-    elif total >= 1.0 and support_count >= max(1, len(verifications) // 2) and contradict_count == 0:
-        final = "supports"
-        reason = "Total score and support coverage meet support condition."
-    else:
-        final = "not enough information"
-        reason = "Evidence does not satisfy support or contradiction conditions."
-
-    return {
-        "final_label": final,
-        "decision_reason": reason,
-        "fact_total_score": round(fact_total, 4),
-        "constraint_total_score": round(constraint_total, 4),
-        "total_score": round(total, 4),
-        "counts": {
-            "support": support_count,
-            "contradict": contradict_count,
-            "insufficient": insufficient_count,
-        },
-        "per_fact_scores": per_fact_scores,
-        "per_constraint_scores": per_constraint_scores,
-    }
-
-
 def normalize_verifications(data):
     fv = data.get("fact_verification", {})
-    if isinstance(fv, dict) and "verifications" in fv:
-        items = fv.get("verifications", []) or []
-    else:
-        vr = data.get("verification_result", {}) or {}
-        items = vr.get("fact_verifications", []) or []
+    items = fv.get("verifications", []) if isinstance(fv, dict) else []
 
     normalized = []
     for item in items:
         normalized.append({
             "fact_id": item.get("fact_id", ""),
-            "fact_text": item.get("fact_text", item.get("atomic_fact", {}).get("text", "")),
+            "fact_text": item.get("fact_text", ""),
             "bound_fact_text": item.get("bound_fact_text", ""),
-            "question": item.get("question", item.get("question_used", "")),
+            "question": item.get("question", ""),
             "question_type": item.get("question_type", ""),
             "answer": item.get("answer", ""),
-            "answer_status": item.get("answer_status", item.get("previous_status", "insufficient")),
+            "answer_status": item.get("answer_status", "insufficient"),
             "verification_label": item.get("verification_label", INSUFFICIENT),
             "evidence_span": item.get("evidence_span", ""),
-            "constraint": item.get("constraint", item.get("atomic_fact", {}).get("constraint", {})),
-            "rely_on": item.get("rely_on", item.get("atomic_fact", {}).get("rely_on", [])),
+            "constraint": item.get("constraint", {}),
+            "rely_on": item.get("rely_on", []),
+            "critical": item.get("critical", False),
         })
     return normalized
+
+
+def aggregate_labels(verifications):
+    critical_items = [v for v in verifications if v.get("critical", False)]
+    noncritical_items = [v for v in verifications if not v.get("critical", False)]
+
+    support_count = sum(1 for v in verifications if v.get("verification_label") == SUPPORTED)
+    contradict_count = sum(1 for v in verifications if v.get("verification_label") == CONTRADICTED)
+    insufficient_count = sum(1 for v in verifications if v.get("verification_label") == INSUFFICIENT)
+
+    critical_support = sum(1 for v in critical_items if v.get("verification_label") == SUPPORTED)
+    critical_contradict = sum(1 for v in critical_items if v.get("verification_label") == CONTRADICTED)
+    critical_insufficient = sum(
+        1 for v in critical_items if v.get("verification_label") in {INSUFFICIENT} or v.get("answer_status") == "api_error"
+    )
+
+    noncritical_insufficient = sum(1 for v in noncritical_items if v.get("verification_label") == INSUFFICIENT)
+    allow_noncritical_insufficient = max(1, math.floor(len(noncritical_items) * 0.3)) if noncritical_items else 0
+
+    per_fact_scores = [fact_score(v) for v in verifications]
+    total_score = round(sum(x["score"] for x in per_fact_scores), 4)
+
+    # Rule 1: any critical contradiction => REFUTES
+    if critical_contradict > 0:
+        return {
+            "final_label": "refutes",
+            "final_label_binary": "refutes",
+            "decision_reason": "At least one critical fact is contradicted.",
+            "counts": {
+                "support": support_count,
+                "contradict": contradict_count,
+                "insufficient": insufficient_count,
+                "critical_support": critical_support,
+                "critical_contradict": critical_contradict,
+                "critical_insufficient": critical_insufficient,
+            },
+            "noncritical_insufficient_allowance": allow_noncritical_insufficient,
+            "total_score": total_score,
+            "per_fact_scores": per_fact_scores,
+        }
+
+    # Rule 2: any critical insufficient => NEI (binary => REFUTES)
+    if critical_insufficient > 0:
+        return {
+            "final_label": "not enough information",
+            "final_label_binary": "refutes",
+            "decision_reason": "At least one critical fact is insufficient.",
+            "counts": {
+                "support": support_count,
+                "contradict": contradict_count,
+                "insufficient": insufficient_count,
+                "critical_support": critical_support,
+                "critical_contradict": critical_contradict,
+                "critical_insufficient": critical_insufficient,
+            },
+            "noncritical_insufficient_allowance": allow_noncritical_insufficient,
+            "total_score": total_score,
+            "per_fact_scores": per_fact_scores,
+        }
+
+    # Rule 3: any contradiction anywhere => REFUTES
+    if contradict_count > 0:
+        return {
+            "final_label": "refutes",
+            "final_label_binary": "refutes",
+            "decision_reason": "There is at least one contradicted fact.",
+            "counts": {
+                "support": support_count,
+                "contradict": contradict_count,
+                "insufficient": insufficient_count,
+                "critical_support": critical_support,
+                "critical_contradict": critical_contradict,
+                "critical_insufficient": critical_insufficient,
+            },
+            "noncritical_insufficient_allowance": allow_noncritical_insufficient,
+            "total_score": total_score,
+            "per_fact_scores": per_fact_scores,
+        }
+
+    # Rule 4: SUPPORTS conditions
+    all_critical_supported = (critical_support == len(critical_items))
+    few_noncritical_insufficient = (noncritical_insufficient <= allow_noncritical_insufficient)
+
+    if all_critical_supported and few_noncritical_insufficient:
+        return {
+            "final_label": "supports",
+            "final_label_binary": "supports",
+            "decision_reason": "All critical facts are supported; no contradictions; non-critical insufficient facts are within tolerance.",
+            "counts": {
+                "support": support_count,
+                "contradict": contradict_count,
+                "insufficient": insufficient_count,
+                "critical_support": critical_support,
+                "critical_contradict": critical_contradict,
+                "critical_insufficient": critical_insufficient,
+            },
+            "noncritical_insufficient_allowance": allow_noncritical_insufficient,
+            "total_score": total_score,
+            "per_fact_scores": per_fact_scores,
+        }
+
+    # Rule 5: otherwise NEI
+    return {
+        "final_label": "not enough information",
+        "final_label_binary": "refutes",
+        "decision_reason": "Critical facts are supported, but too many non-critical facts remain insufficient.",
+        "counts": {
+            "support": support_count,
+            "contradict": contradict_count,
+            "insufficient": insufficient_count,
+            "critical_support": critical_support,
+            "critical_contradict": critical_contradict,
+            "critical_insufficient": critical_insufficient,
+        },
+        "noncritical_insufficient_allowance": allow_noncritical_insufficient,
+        "total_score": total_score,
+        "per_fact_scores": per_fact_scores,
+    }
 
 
 def process_data_item(data):
@@ -273,7 +245,6 @@ def main(args):
                 results.append(future.result())
             except Exception as e:
                 print(f"Error in future: {e}")
-                continue
 
     results = sorted(results, key=lambda x: x["id"])
 
