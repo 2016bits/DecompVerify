@@ -1,201 +1,193 @@
 import json
 
-decompose_instruct = """You are an expert fact-checking planner.
 
-Decompose the claim into:
-1. atomic facts
-2. constraints
+decompose_instruct = """
+You are an expert planner for multi-hop fact verification.
 
-Requirements:
-- Do not extract keywords.
-- Each atomic fact must contain exactly one main relation.
-- Atomic facts must be minimal and independently verifiable.
-- If an intermediate entity is needed, use a variable such as ?x.
-- Use depends_on to show dependencies between atomic facts.
-- Put negation, comparison, time, and quantity into constraints.
-- Do not add external knowledge.
-- Return JSON only.
+Task:
+Decompose a claim into minimal atomic facts for step-wise verification.
+
+Core principle:
+Each atomic fact must express exactly ONE core verifiable relation.
+
+Allowed decomposition types:
+- simple
+- coordinated
+- nested
+- quantified_or_comparative
+
+Constraint policy:
+Only keep these three constraint types:
+- negation
+- time
+- quantity
+
+Important output rules:
+- Return VALID JSON only.
+- Do not output markdown.
+- Do not output explanations.
+- Use only this schema.
+- Use ids f1, f2, f3, ...
+- rely_on may only contain earlier fact ids.
+- negation must be true or null.
+- time must be a list.
+- quantity must be a list.
 
 Output schema:
 {
   "claim": "...",
+  "decomposition_type": "simple",
   "atomic_facts": [
     {
       "id": "f1",
-      "subject": "...",
-      "predicate": "...",
-      "object": "...",
-      "role": "bridge|verify|anchor",
-      "depends_on": []
-    }
-  ],
-  "constraints": [
-    {
-      "type": "negation|comparison|time|quantity",
-      "target_facts": ["f1"],
-      "operator": "not|before|after|earlier_than|later_than|>|<|=|>=|<=",
-      "value": ""
+      "text": "...",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      }
     }
   ]
 }
 """
 
-decompose_examples = """
-Examples:
-{
-    "claim": "Robert J. O'Neill was born April 10, 1976.",
-    "atomic_facts": [
-      {
-        "id": "f1",
-        "subject": "Robert J. O'Neill",
-        "predicate": "born on",
-        "object": "April 10, 1976",
-        "role": "verify",
-        "depends_on": []
-      }
-    ],
-    "constraints": []
-  },
-  {
-    "claim": "The director of the film starring Tom Hanks was born in California.",
-    "atomic_facts": [
-      {
-        "id": "f1",
-        "subject": "Tom Hanks",
-        "predicate": "starred in",
-        "object": "?film",
-        "role": "bridge",
-        "depends_on": []
-      },
-      {
-        "id": "f2",
-        "subject": "?film",
-        "predicate": "directed by",
-        "object": "?director",
-        "role": "bridge",
-        "depends_on": ["f1"]
-      },
-      {
-        "id": "f3",
-        "subject": "?director",
-        "predicate": "born in",
-        "object": "California",
-        "role": "verify",
-        "depends_on": ["f2"]
-      }
-    ],
-    "constraints": []
-  },
-  {
-    "claim": "Puerto Rico is not an unincorporated territory of the United States.",
-    "atomic_facts": [
-      {
-        "id": "f1",
-        "subject": "Puerto Rico",
-        "predicate": "is",
-        "object": "an unincorporated territory of the United States",
-        "role": "verify",
-        "depends_on": []
-      }
-    ],
-    "constraints": [
-      {
-        "type": "negation",
-        "target_facts": ["f1"],
-        "operator": "not",
-        "value": ""
-      }
-    ]
-  },
-  {
-    "claim": "Cyndi Lauper won the Best New Artist award earlier than Adele.",
-    "atomic_facts": [
-      {
-        "id": "f1",
-        "subject": "Cyndi Lauper",
-        "predicate": "won Best New Artist in",
-        "object": "?t1",
-        "role": "anchor",
-        "depends_on": []
-      },
-      {
-        "id": "f2",
-        "subject": "Adele",
-        "predicate": "won Best New Artist in",
-        "object": "?t2",
-        "role": "anchor",
-        "depends_on": []
-      }
-    ],
-    "constraints": [
-      {
-        "type": "comparison",
-        "target_facts": ["f1", "f2"],
-        "operator": "earlier_than",
-        "value": ""
-      }
-    ]
-  }
-"""
 
-decompose_repair_prompt = """You are an expert checker for multi-hop fact-checking plans.
+decompose_examples = r'''
+Example 1:
+{
+  "claim": "Marie Curie was born in Warsaw and won two Nobel Prizes.",
+  "decomposition_type": "coordinated",
+  "atomic_facts": [
+    {
+      "id": "f1",
+      "text": "Marie Curie was born in Warsaw",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      }
+    },
+    {
+      "id": "f2",
+      "text": "Marie Curie won Nobel Prizes",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": ["two"]
+      }
+    }
+  ]
+}
+
+Example 2:
+{
+  "claim": "The director of the film starring Tom Hanks was born in California.",
+  "decomposition_type": "nested",
+  "atomic_facts": [
+    {
+      "id": "f1",
+      "text": "Tom Hanks starred in ?film",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      }
+    },
+    {
+      "id": "f2",
+      "text": "?film was directed by ?director",
+      "rely_on": ["f1"],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      }
+    },
+    {
+      "id": "f3",
+      "text": "?director was born in California",
+      "rely_on": ["f2"],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      }
+    }
+  ]
+}
+'''
+
+
+decompose_repair_prompt = """
+You are an expert checker for multi-hop fact decomposition.
 
 You are given:
 1. a claim
-2. a decomposition plan with atomic facts and constraints
-3. detected issues in the decomposition
+2. a current decomposition result
+3. detected issues
 
-Your task:
 Repair the decomposition so that it is faithful to the claim and suitable for step-wise verification.
 
-What to check:
-1. Each atomic fact must faithfully reflect the claim.
-2. Each atomic fact must contain exactly one main relation.
-3. Dependencies must represent real answer flow:
-   - fact B depends on fact A only if fact B needs a variable resolved by fact A.
-4. Relative clauses or modifiers must attach to the correct entity.
-5. Do not introduce facts that change the meaning of the claim.
-6. Remove redundant or incorrect atomic facts.
-7. Keep the schema unchanged.
-8. Return JSON only.
+Repair rules:
+- Return VALID JSON only.
+- Do not output markdown.
+- Do not output explanations.
+- Use one of these decomposition types only:
+  - simple
+  - coordinated
+  - nested
+  - quantified_or_comparative
+- Each atomic fact must only contain:
+  - id
+  - text
+  - rely_on
+  - constraint
+- constraint must only contain:
+  - negation
+  - time
+  - quantity
+- negation must be true or null.
+- time must be a list.
+- quantity must be a list.
+- rely_on may only reference earlier fact ids.
 
-claim:
-[CLAIM]
-
-current decomposition:
-[DECOMPOSITION]
-
+claim: [CLAIM]
+current decomposition: [DECOMPOSITION]
 issues:
 [ISSUES]
 
 Return JSON only in this schema:
-{{
+{
   "claim": "...",
+  "decomposition_type": "simple",
   "atomic_facts": [
-    {{
+    {
       "id": "f1",
-      "subject": "...",
-      "predicate": "...",
-      "object": "...",
-      "role": "bridge|verify|anchor",
-      "depends_on": []
-    }}
-  ],
-  "constraints": [
-    {{
-      "type": "negation|comparison|time|quantity",
-      "target_facts": ["f1"],
-      "operator": "not|before|after|earlier_than|later_than|>|<|=|>=|<=",
-      "value": ""
-    }}
+      "text": "...",
+      "rely_on": [],
+      "constraint": {
+        "negation": null,
+        "time": [],
+        "quantity": []
+      }
+    }
   ]
-}}
+}
 """
 
-def get_decompose_prompt(claim):
-    prompt = decompose_instruct + decompose_examples + f'\nClaim: "{claim}"\nDecomposition:'
-    return prompt
+
+def get_decompose_prompt(claim: str) -> str:
+    return decompose_instruct + "\n" + decompose_examples + f'\nClaim: "{claim}"\nReturn JSON only:'
+
+
 
 def get_repair_prompt(claim, decomposition, issues):
-    prompt = decompose_repair_prompt.replace('[CLAIM]', claim).replace('[DECOMPOSITION]', json.dumps(decomposition, indent=4)).replace('[ISSUES]', '\n'.join(f'- {issue}' for issue in issues))
-    return prompt
+    return (
+        decompose_repair_prompt.replace('[CLAIM]', claim)
+        .replace('[DECOMPOSITION]', json.dumps(decomposition, indent=2, ensure_ascii=False))
+        .replace('[ISSUES]', '\n'.join(f'- {issue}' for issue in issues))
+    )

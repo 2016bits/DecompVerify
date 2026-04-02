@@ -2,7 +2,8 @@ import json
 import argparse
 import re
 import os
-
+import time
+import random
 from tqdm import tqdm
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -96,10 +97,27 @@ def build_client_and_model(plan, port='8370'):
             api_key="EMPTY",
             base_url=f"http://localhost:{port}/v1"
         )
-        model = "gpt-4o"
+        model = "qwen2.5-72b-awq"
         system_prompt = "You are a helpful assistant."
         extra_body = None
         max_tokens = None
+        temperature = 0.7
+        return client, model, system_prompt, extra_body, max_tokens, temperature
+    
+    elif plan.startswith("qc_plan"):
+        api_key = os.getenv("AIPING_API_KEY")
+        if not api_key:
+            raise ValueError("AIPING_API_KEY is not set in environment variables.")
+        azure_endpoint = "https://www.aiping.cn/api/v1"
+        model = "DeepSeek-V3.2"
+        
+        client = OpenAI(
+            api_key=api_key,
+            base_url=azure_endpoint
+        )
+        system_prompt = None
+        extra_body = {}
+        max_tokens = 2048
         temperature = 0.7
         return client, model, system_prompt, extra_body, max_tokens, temperature
 
@@ -112,6 +130,9 @@ def build_client_and_model(plan, port='8370'):
 
 def llm(input_text, plan='local', port='8370'):
     client, model, system_prompt, extra_body, max_tokens, temperature = build_client_and_model(plan, port)
+
+    # simple throttle to reduce 429 rate-limit errors
+    time.sleep(1.5)
 
     messages = []
     if system_prompt:
@@ -164,16 +185,17 @@ def llm(input_text, plan='local', port='8370'):
     return content
 
 
-def extract_json_block(text):
+def _clean_text(text):
     if text is None:
-        raise ValueError("Model output is None.")
-    if not isinstance(text, str):
-        text = str(text)
+        return ""
+    text = str(text)
+    text = text.replace("\u2019", "'").replace("\u2018", "'")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    return re.sub(r"\s+", " ", text).strip()
 
+
+def extract_json_block(text):
     text = text.strip()
-    if not text:
-        raise ValueError("Model output is empty.")
-
     code_block_pattern = r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```"
     match = re.search(code_block_pattern, text, flags=re.DOTALL)
     if match:
@@ -181,7 +203,6 @@ def extract_json_block(text):
 
     first_brace = text.find("{")
     first_bracket = text.find("[")
-
     candidates = []
     if first_brace != -1:
         candidates.append((first_brace, "{", "}"))
@@ -189,7 +210,7 @@ def extract_json_block(text):
         candidates.append((first_bracket, "[", "]"))
 
     if not candidates:
-        raise ValueError(f"No JSON object or array found in model output:\n{text[:500]}")
+        raise ValueError("No JSON object or array found in model output.")
 
     candidates.sort(key=lambda x: x[0])
     start_idx, open_ch, close_ch = candidates[0]
@@ -199,7 +220,6 @@ def extract_json_block(text):
     escape = False
     for i in range(start_idx, len(text)):
         ch = text[i]
-
         if in_string:
             if escape:
                 escape = False
@@ -212,353 +232,248 @@ def extract_json_block(text):
             if ch == '"':
                 in_string = True
                 continue
-            if ch == open_ch:
-                stack += 1
-            elif ch == close_ch:
-                stack -= 1
-                if stack == 0:
-                    return text[start_idx:i + 1].strip()
 
-    raise ValueError(f"Incomplete JSON block in model output:\n{text[:500]}")
+        if ch == open_ch:
+            stack += 1
+        elif ch == close_ch:
+            stack -= 1
+            if stack == 0:
+                return text[start_idx:i + 1].strip()
+
+    raise ValueError("Incomplete JSON block in model output.")
 
 
 def parse_answer_output(output_text):
     json_text = extract_json_block(output_text)
-    data = json.loads(json_text)
-    if not isinstance(data, dict):
-        raise ValueError(f"Parsed JSON is not a dict: {type(data)}")
-    return data
+    return json.loads(json_text)
 
 
-def extract_variables(text):
-    if not isinstance(text, str):
-        return set()
-    return set(re.findall(r"\?[A-Za-z_][A-Za-z0-9_]*", text))
-
-
-def fact_variables(fact):
-    return extract_variables(fact.get("subject", "")) | extract_variables(fact.get("object", ""))
-
-
-def fill_text(text, bindings):
-    if not isinstance(text, str):
+def replace_placeholders(text, bindings):
+    text = _clean_text(text)
+    if not text:
         return text
-    for var, value in bindings.items():
-        text = text.replace(var, value)
+    for var in sorted(bindings.keys(), key=len, reverse=True):
+        value = _clean_text(bindings[var])
+        if var.startswith("?") and value:
+            text = text.replace(var, value)
     return text
 
 
-def fill_fact(fact, bindings):
-    if fact is None:
-        fact = {}
-    return {
-        "id": fact.get("id", ""),
-        "subject": fill_text(fact.get("subject", ""), bindings),
-        "predicate": fact.get("predicate", ""),
-        "object": fill_text(fact.get("object", ""), bindings),
-        "role": fact.get("role", "verify"),
-        "depends_on": fact.get("depends_on", []) if isinstance(fact.get("depends_on", []), list) else []
+def replace_placeholders_in_obj(obj, bindings):
+    if isinstance(obj, str):
+        return replace_placeholders(obj, bindings)
+    if isinstance(obj, list):
+        return [replace_placeholders_in_obj(x, bindings) for x in obj]
+    if isinstance(obj, dict):
+        return {k: replace_placeholders_in_obj(v, bindings) for k, v in obj.items()}
+    return obj
+
+
+def unresolved_vars(text):
+    return sorted(set(re.findall(r"\?[A-Za-z_][A-Za-z0-9_]*", _clean_text(text))))
+
+
+def merge_bindings(current_bindings, new_bindings):
+    merged = dict(current_bindings)
+    for k, v in (new_bindings or {}).items():
+        k = _clean_text(k)
+        v = _clean_text(v)
+        if k.startswith("?") and v:
+            merged[k] = v
+    return merged
+
+
+def normalize_answer_result(parsed, fact_id, used_question):
+    answer = _clean_text(parsed.get("answer", "insufficient"))
+    status_raw = _clean_text(parsed.get("status", "insufficient")).lower()
+    status_map = {
+        "support": "supported",
+        "supported": "supported",
+        "contradict": "contradicted",
+        "contradicted": "contradicted",
+        "insufficient": "insufficient",
+        "nei": "insufficient",
+        "api_error": "api_error",
     }
-
-
-def normalize_answer_result(parsed, atomic_fact, selected_question):
-    if parsed is None:
-        parsed = {}
-    if not isinstance(parsed, dict):
-        raise ValueError(f"Answer output is not a dict: {parsed}")
-
-    fact_id = parsed.get("fact_id", atomic_fact["id"])
-    if fact_id is None:
-        fact_id = atomic_fact["id"]
-    fact_id = str(fact_id).strip()
-
-    question = parsed.get("question", selected_question)
-    if question is None:
-        question = selected_question
-    question = str(question).strip()
-
-    answer = parsed.get("answer", "")
-    if answer is None:
-        answer = ""
-    answer = str(answer).strip()
-
-    status = parsed.get("status", "insufficient")
-    if status is None:
-        status = "insufficient"
-    status = str(status).strip().lower()
-
-    evidence_span = parsed.get("evidence_span", "")
-    if evidence_span is None:
-        evidence_span = ""
-    evidence_span = str(evidence_span).strip()
-
+    status = status_map.get(status_raw, "insufficient")
+    evidence_span = _clean_text(parsed.get("evidence_span", ""))
     bindings_update = parsed.get("bindings_update", {})
     if not isinstance(bindings_update, dict):
         bindings_update = {}
 
-    if status not in {"supported", "contradicted", "insufficient"}:
-        status = "insufficient"
-
-    normalized_bindings = {}
-    for k, v in bindings_update.items():
-        if isinstance(k, str) and k.startswith("?") and v is not None:
-            normalized_bindings[k] = str(v).strip()
-
     return {
         "fact_id": fact_id,
-        "question": question,
-        "answer": answer,
+        "question": used_question,
+        "answer": answer if answer else "insufficient",
         "status": status,
         "evidence_span": evidence_span,
-        "bindings_update": normalized_bindings
+        "bindings_update": bindings_update,
     }
 
 
-def validate_answer_result(result, atomic_fact):
-    if result["fact_id"] != atomic_fact["id"]:
-        raise ValueError(f"fact_id mismatch: {result['fact_id']} vs {atomic_fact['id']}")
-
-    if result["status"] not in {"supported", "contradicted", "insufficient"}:
+def validate_answer_result(result, fact_id):
+    if result["fact_id"] != fact_id:
+        raise ValueError(f"fact_id mismatch: {result['fact_id']} vs {fact_id}")
+    if result["status"] not in {"supported", "contradicted", "insufficient", "api_error"}:
         raise ValueError(f"invalid status: {result['status']}")
-
+    if not isinstance(result["bindings_update"], dict):
+        raise ValueError("bindings_update must be a dict")
     return True
 
 
-def topo_sort_atomic_facts(atomic_facts):
-    if atomic_facts is None:
-        atomic_facts = []
-    if not isinstance(atomic_facts, list):
-        raise ValueError("atomic_facts must be a list.")
-
-    clean_atomic_facts = []
-    for idx, fact in enumerate(atomic_facts):
-        if fact is None:
-            print(f"[Warn] Skip None atomic fact at idx={idx}")
-            continue
-        if not isinstance(fact, dict):
-            print(f"[Warn] Skip non-dict atomic fact at idx={idx}: {fact}")
-            continue
-        if "id" not in fact:
-            print(f"[Warn] Skip atomic fact without id at idx={idx}: {fact}")
-            continue
-        if "depends_on" not in fact or fact["depends_on"] is None:
-            fact["depends_on"] = []
-        clean_atomic_facts.append(fact)
-
-    fact_map = {fact["id"]: fact for fact in clean_atomic_facts}
-    indegree = {fact["id"]: 0 for fact in clean_atomic_facts}
-    graph = {fact["id"]: [] for fact in clean_atomic_facts}
-
-    for fact in clean_atomic_facts:
-        for dep in fact.get("depends_on", []):
-            if dep in fact_map:
-                graph[dep].append(fact["id"])
-                indegree[fact["id"]] += 1
-
-    queue = [fid for fid, deg in indegree.items() if deg == 0]
-    queue.sort()
-
-    order = []
-    while queue:
-        cur = queue.pop(0)
-        order.append(fact_map[cur])
-        for nxt in graph[cur]:
-            indegree[nxt] -= 1
-            if indegree[nxt] == 0:
-                queue.append(nxt)
-                queue.sort()
-
-    if len(order) != len(clean_atomic_facts):
-        raise ValueError("Cycle detected or invalid dependency graph.")
-
-    return order
-
-
-def choose_question(question_plan_item, filled_fact):
-    q = question_plan_item.get("question_templates", {})
-    role = question_plan_item.get("role", "verify")
-
-    subject = filled_fact.get("subject", "")
-    obj = filled_fact.get("object", "")
-
-    subject_is_var = isinstance(subject, str) and subject.startswith("?")
-    object_is_var = isinstance(obj, str) and obj.startswith("?")
-    unresolved = subject_is_var or object_is_var
-
-    if role == "bridge":
-        if unresolved:
-            return q.get("primary", "")
-        if q.get("boolean"):
-            return q["boolean"]
-        if q.get("boolean_template"):
-            known_value = subject if not subject_is_var else obj
-            return q["boolean_template"].replace("{value}", known_value)
-        return q.get("alternate") or q.get("primary", "")
-
-    if role == "verify":
-        if q.get("boolean"):
-            return q["boolean"]
-        if q.get("boolean_template"):
-            known_value = subject if not subject_is_var else obj
-            return q["boolean_template"].replace("{value}", known_value)
-        return q.get("alternate") or q.get("primary", "")
-
-    if role == "anchor":
-        return q.get("primary", "")
-
-    return q.get("primary", "")
-
-
-def infer_bindings_update(filled_fact, answer):
-    """
-    当模型未显式返回 bindings_update 时，尝试根据 filled_fact 自动推断。
-    """
-    update = {}
-    subject = filled_fact.get("subject", "")
-    obj = filled_fact.get("object", "")
-
-    if not isinstance(answer, str):
-        return update
-
-    ans = answer.strip()
-    if not ans:
-        return update
-
-    if isinstance(subject, str) and subject.startswith("?") and not (isinstance(obj, str) and obj.startswith("?")):
-        update[subject] = ans
-    elif isinstance(obj, str) and obj.startswith("?") and not (isinstance(subject, str) and subject.startswith("?")):
-        update[obj] = ans
-
-    return update
-
-
-def fallback_answer_result(atomic_fact, filled_fact, selected_question):
+def fallback_answer_result(fact_id, used_question, error_type="api_error"):
     return {
-        "fact_id": atomic_fact.get("id", ""),
-        "question": selected_question,
-        "answer": "",
-        "status": "insufficient",
+        "fact_id": fact_id,
+        "question": used_question,
+        "answer": error_type,
+        "status": error_type,
         "evidence_span": "",
-        "bindings_update": {}
+        "bindings_update": {},
     }
 
 
-def answer_one_fact(claim, evidence, atomic_fact, question_plan_item, bindings, plan, port):
-    filled_fact = fill_fact(atomic_fact, bindings)
-    selected_question = choose_question(question_plan_item, filled_fact)
+def is_rate_limit_error(e):
+    msg = str(e)
+    return "429" in msg or "频率超限" in msg or "rate limit" in msg.lower()
+
+
+def answer_one_question(claim, evidence, atomic_fact, question_item, current_bindings, plan, port):
+    filled_fact = replace_placeholders_in_obj(atomic_fact, current_bindings)
+    filled_question_item = replace_placeholders_in_obj(question_item, current_bindings)
+    used_question = _clean_text(filled_question_item.get("main_question", ""))
+    fact_id = atomic_fact.get("id", "")
 
     infer_count = 0
     last_error = None
-
-    while infer_count < 3:
-        output = None
+    while infer_count < 5:
         try:
             prompt = get_answer_prompt(
                 claim=claim,
                 evidence=evidence,
-                atomic_fact=atomic_fact,
-                filled_fact=filled_fact,
-                question_plan=question_plan_item,
-                bindings=bindings,
-                question=selected_question
+                atomic_fact=filled_fact,
+                question_item=filled_question_item,
+                bindings=current_bindings,
+                question=used_question,
             )
             output = llm(prompt, plan=plan, port=port)
             parsed = parse_answer_output(output)
-            result = normalize_answer_result(parsed, atomic_fact, selected_question)
-            validate_answer_result(result, atomic_fact)
-
-            if not result["bindings_update"] and result["answer"]:
-                inferred = infer_bindings_update(filled_fact, result["answer"])
-                result["bindings_update"] = inferred
-
-            return result, filled_fact
+            result = normalize_answer_result(parsed, fact_id, used_question)
+            validate_answer_result(result, fact_id)
+            return result
         except Exception as e:
             last_error = e
-            preview = output[:500] if isinstance(output, str) else repr(output)
-            print(f"[Retry {infer_count + 1}/3] Error during answering for {atomic_fact.get('id', '')}: {e}")
-            print(f"[Output Preview] {preview}")
+            print(f"[Retry {infer_count + 1}/5] Error during answer generation for {fact_id}: {e}")
+
+            if is_rate_limit_error(e):
+                wait_time = (2 ** infer_count) + random.uniform(0.5, 1.5)
+            else:
+                wait_time = 1.0 + random.uniform(0.2, 0.8)
+
+            print(f"Sleeping {wait_time:.2f}s before retry...")
+            time.sleep(wait_time)
             infer_count += 1
 
-    print(f"[Fallback] fact: {atomic_fact.get('id', '')}, last_error: {last_error}")
-    return fallback_answer_result(atomic_fact, filled_fact, selected_question), filled_fact
+    print(f"[Fallback] fact: {fact_id}, last_error: {last_error}")
+    return fallback_answer_result(fact_id, used_question, error_type="api_error")
 
 
-def execute_answering(claim, evidence, decomposition, question_plan, plan, port):
-    if decomposition is None:
-        decomposition = {
-            "claim": claim,
-            "atomic_facts": [],
-            "constraints": []
-        }
-    if question_plan is None:
-        question_plan = []
+def order_question_items(question_items):
+    indexed = list(enumerate(question_items))
+    indexed.sort(key=lambda x: (len(x[1].get("rely_on", []) or []), x[0]))
+    return [item for _, item in indexed]
 
-    atomic_facts = decomposition.get("atomic_facts", [])
-    ordered_atomic_facts = topo_sort_atomic_facts(atomic_facts)
 
-    question_plan_map = {}
-    for item in question_plan:
-        if isinstance(item, dict) and "fact_id" in item:
-            question_plan_map[item["fact_id"]] = item
+def generate_answers_for_item(data, plan, port):
+    claim = data["claim"]
+    evidence = data["gold_evidence"]
+    decomposition = data.get("decomposition", {}) or {}
+    question_plan = data.get("question_plan", {}) or {}
 
-    bindings = {}
-    answer_plan = []
+    atomic_facts = decomposition.get("atomic_facts", []) or []
+    fact_map = {f.get("id"): f for f in atomic_facts}
 
-    for atomic_fact in ordered_atomic_facts:
-        if atomic_fact["id"] not in question_plan_map:
-            raise ValueError(f"Missing question_plan for fact {atomic_fact['id']}")
+    ordered_question_items = order_question_items(question_plan.get("question_items", []) or [])
+    final_bindings = {}
+    answers = []
+    answer_issues = []
 
-        question_item = question_plan_map[atomic_fact["id"]]
-        result, filled_fact = answer_one_fact(
+    for qitem in ordered_question_items:
+        fact_id = qitem.get("fact_id", "")
+        atomic_fact = fact_map.get(fact_id, {
+            "id": fact_id,
+            "text": qitem.get("fact_text", ""),
+            "rely_on": qitem.get("rely_on", []),
+            "constraint": qitem.get("constraint", {}),
+        })
+
+        result = answer_one_question(
             claim=claim,
             evidence=evidence,
             atomic_fact=atomic_fact,
-            question_plan_item=question_item,
-            bindings=bindings,
+            question_item=qitem,
+            current_bindings=final_bindings,
             plan=plan,
-            port=port
+            port=port,
         )
 
-        bindings.update(result.get("bindings_update", {}))
+        answers.append(result)
+        final_bindings = merge_bindings(final_bindings, result.get("bindings_update", {}))
 
-        answer_plan.append({
-            "fact_id": atomic_fact["id"],
-            "filled_fact": filled_fact,
-            "question_used": result["question"],
-            "answer": result["answer"],
-            "status": result["status"],
-            "evidence_span": result["evidence_span"],
-            "bindings_update": result["bindings_update"]
-        })
+        still_unresolved = unresolved_vars(result.get("question", ""))
+        if still_unresolved:
+            answer_issues.append(
+                f"Question for {fact_id} still has unresolved variables after answering: {still_unresolved}"
+            )
 
-    return answer_plan, bindings
+    return {
+        "claim": claim,
+        "answers": answers,
+        "final_bindings": final_bindings,
+    }, answer_issues
 
 
 def process_data_item(data, plan, port):
-    claim = data["claim"]
-    evidence = data["gold_evidence"]
-    decomposition = data["decomposition"]
-    question_plan = data["question_plan"]
+    decomposition = data.get("decomposition", None)
+    question_plan = data.get("question_plan", None)
 
-    answer_plan, final_bindings = execute_answering(
-        claim=claim,
-        evidence=evidence,
-        decomposition=decomposition,
-        question_plan=question_plan,
+    if decomposition is None and "atomic_facts" in data and isinstance(data["atomic_facts"], dict):
+        decomposition = data["atomic_facts"]
+
+    if decomposition is None:
+        decomposition = {
+            "claim": data["claim"],
+            "atomic_facts": [],
+            "constraints": []
+        }
+
+    if question_plan is None:
+        question_plan = {"question_items": []}
+
+    answer_result, answer_issues = generate_answers_for_item(
+        {
+            "claim": data["claim"],
+            "gold_evidence": data["gold_evidence"],
+            "decomposition": decomposition,
+            "question_plan": question_plan,
+        },
         plan=plan,
-        port=port
+        port=port,
     )
 
     return {
         "id": data["id"],
-        "claim": claim,
-        "gold_evidence": evidence,
-        "num_hops": data["num_hops"],
-        "label": data["label"],
+        "claim": data["claim"],
+        "gold_evidence": data["gold_evidence"],
+        "num_hops": data.get("num_hops", None),
+        "label": data.get("label", None),
         "decomposition": decomposition,
         "question_plan": question_plan,
-        "answer_plan": answer_plan,
-        "final_bindings": final_bindings
+        "answer_result": answer_result,
+        "answer_issues": answer_issues,
+        "answer_used_fallback": any(
+            x["status"] == "insufficient" and x["answer"] == "insufficient" and not x["evidence_span"]
+            for x in answer_result["answers"]
+        ),
     }
 
 
@@ -593,7 +508,7 @@ def main(args):
             }
 
         if question_plan is None:
-            question_plan = []
+            question_plan = {"question_items": []}
 
         dataset.append({
             "id": data["id"],
@@ -650,7 +565,7 @@ if __name__ == "__main__":
     parser.add_argument('--end', type=int, default=200, help='End index')
     parser.add_argument('--port', type=str, default='8370', help='Port for local LLM API')
     parser.add_argument('--max_workers', type=int, default=8, help='Number of threads')
-    parser.add_argument('--plan', type=str, default='plan3.3', help='LLM plan: local/scnet/iflow/azure')
+    parser.add_argument('--plan', type=str, default='local', help='LLM plan: local/scnet/iflow/azure')
 
     parser.add_argument(
         '--in_path',

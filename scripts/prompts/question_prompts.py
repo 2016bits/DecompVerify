@@ -1,211 +1,233 @@
 import json
 
-question_instruct = """You are an expert planner for multi-hop fact verification.
+question_instruct = """
+You are an expert planner for multi-hop fact verification.
 
-Given a claim and one atomic fact from its decomposition, generate question templates for verifying this atomic fact.
+Task:
+Convert a decomposed claim into verification questions.
 
-Requirements:
-1. Return JSON only.
-2. Be faithful to the atomic fact.
-3. If role is "bridge", generate questions that identify the unknown variable.
-4. If role is "verify", generate questions that verify whether the relation holds.
-5. If role is "anchor", generate questions that retrieve the missing attribute value.
-6. If a variable is unresolved, keep it as a placeholder such as ?manager, ?film, ?director, ?t1.
-7. Keep questions natural and concise.
-8. Prefer question forms that are easy to answer directly from evidence.
-9. The output must follow the schema exactly.
+Important policy:
+1. Each atomic fact gets exactly one main question.
+2. The main question should target the core relation of the atomic fact.
+3. If the atomic fact has a time constraint, prefer a WH time question as the main question.
+4. If the atomic fact has a quantity constraint, prefer a WH quantity question as the main question.
+5. For negation, do NOT force a WH question. Use a normal positive or direct verification question.
+6. constraint_questions should be optional and usually empty.
+7. Only generate constraint_questions for extra time/quantity clarification when clearly useful.
+8. Do not generate extra constraint questions for negation.
+9. Keep wording close to the original atomic fact.
+10. Return JSON only.
+
+Allowed question_type values:
+- relation_yesno
+- entity_wh
+- time_wh
+- quantity_wh
+- description_wh
 
 Output schema:
-{{
-  "fact_id": "f1",
-  "role": "bridge|verify|anchor",
-  "question_templates": {{
-    "primary": "...",
-    "alternate": "...",
-    "boolean": "...",
-    "boolean_template": "..."
-  }}
-}}
-"""
-
-question_examples = """Examples:
-
-Claim:
-"The director of the film starring Tom Hanks was born in California."
-
-Atomic fact:
 {
-  "id": "f1",
-  "subject": "Tom Hanks",
-  "predicate": "starred in",
-  "object": "?film",
-  "role": "bridge",
-  "depends_on": []
-}
-
-Output:
-{
-  "fact_id": "f1",
-  "role": "bridge",
-  "question_templates": {
-    "primary": "What film did Tom Hanks star in?",
-    "alternate": "Which film starred Tom Hanks?",
-    "boolean": "",
-    "boolean_template": "Did Tom Hanks star in {value}?"
-  }
-}
-
-Claim:
-"The director of the film starring Tom Hanks was born in California."
-
-Atomic fact:
-{
-  "id": "f2",
-  "subject": "?film",
-  "predicate": "directed by",
-  "object": "?director",
-  "role": "bridge",
-  "depends_on": ["f1"]
-}
-
-Output:
-{
-  "fact_id": "f2",
-  "role": "bridge",
-  "question_templates": {
-    "primary": "Who directed ?film?",
-    "alternate": "Who was the director of ?film?",
-    "boolean": "",
-    "boolean_template": "Did {value} direct ?film?"
-  }
-}
-
-Claim:
-"The director of the film starring Tom Hanks was born in California."
-
-Atomic fact:
-{
-  "id": "f3",
-  "subject": "?director",
-  "predicate": "born in",
-  "object": "California",
-  "role": "verify",
-  "depends_on": ["f2"]
-}
-
-Output:
-{
-  "fact_id": "f3",
-  "role": "verify",
-  "question_templates": {
-    "primary": "Where was ?director born?",
-    "alternate": "Was ?director born in California?",
-    "boolean": "Is it true that ?director was born in California?",
-    "boolean_template": ""
-  }
-}
-
-Claim:
-"Cyndi Lauper won the Best New Artist award earlier than Adele."
-
-Atomic fact:
-{
-  "id": "f1",
-  "subject": "Cyndi Lauper",
-  "predicate": "won Best New Artist in",
-  "object": "?t1",
-  "role": "anchor",
-  "depends_on": []
-}
-
-Output:
-{
-  "fact_id": "f1",
-  "role": "anchor",
-  "question_templates": {
-    "primary": "When did Cyndi Lauper win the Best New Artist award?",
-    "alternate": "In what year did Cyndi Lauper win the Best New Artist award?",
-    "boolean": "",
-    "boolean_template": ""
-  }
-}
-
-Claim:
-"Jack McFarland is the best known role of the host of the 64th Annual Tony Awards."
-
-Atomic fact:
-{
-  "id": "f1",
-  "subject": "?actor",
-  "predicate": "played",
-  "object": "Jack McFarland",
-  "role": "bridge",
-  "depends_on": []
-}
-
-Output:
-{
-  "fact_id": "f1",
-  "role": "bridge",
-  "question_templates": {
-    "primary": "Who played Jack McFarland?",
-    "alternate": "Which actor played Jack McFarland?",
-    "boolean": "",
-    "boolean_template": "Did {value} play Jack McFarland?"
-  }
-}
-
-Claim:
-"Jack McFarland is the best known role of the host of the 64th Annual Tony Awards."
-
-Atomic fact:
-{
-  "id": "f2",
-  "subject": "?actor",
-  "predicate": "hosted",
-  "object": "64th Annual Tony Awards",
-  "role": "bridge",
-  "depends_on": ["f1"]
-}
-
-Output:
-{
-  "fact_id": "f2",
-  "role": "bridge",
-  "question_templates": {
-    "primary": "Who hosted the 64th Annual Tony Awards?",
-    "alternate": "Who was the host of the 64th Annual Tony Awards?",
-    "boolean": "",
-    "boolean_template": "Did {value} host the 64th Annual Tony Awards?"
-  }
-}
-
-Claim:
-"Puerto Rico is not an unincorporated territory of the United States."
-
-Atomic fact:
-{
-  "id": "f1",
-  "subject": "Puerto Rico",
-  "predicate": "is",
-  "object": "an unincorporated territory of the United States",
-  "role": "verify",
-  "depends_on": []
-}
-
-Output:
-{
-  "fact_id": "f1",
-  "role": "verify",
-  "question_templates": {
-    "primary": "What is Puerto Rico's political status with respect to the United States?",
-    "alternate": "Is Puerto Rico an unincorporated territory of the United States?",
-    "boolean": "Is it true that Puerto Rico is an unincorporated territory of the United States?",
-    "boolean_template": ""
-  }
+  "claim": "...",
+  "decomposition_type": "...",
+  "question_items": [
+    {
+      "fact_id": "f1",
+      "main_question": "... ?",
+      "question_type": "relation_yesno|entity_wh|time_wh|quantity_wh|description_wh",
+      "constraint_questions": [
+        {
+          "type": "time|quantity",
+          "question": "... ?"
+        }
+      ],
+      "search_hints": ["...", "..."]
+    }
+  ]
 }
 """
 
-def get_question_prompt(claim, atomic_fact):
-    prompt = question_instruct + question_examples + f'\nClaim: "{claim}"\nAtomic fact: {json.dumps(atomic_fact)}\nOutput:'
-    return prompt
+question_examples = r'''
+Example 1:
+Input decomposition:
+{
+  "claim": "The capacity of the stadium that is the home ground of the team that Aamer Iqbal played for is 27,000.",
+  "decomposition_type": "quantified_or_comparative",
+  "atomic_facts": [
+    {
+      "id": "f1",
+      "text": "Aamer Iqbal played for ?team",
+      "rely_on": [],
+      "constraint": {"negation": null, "time": [], "quantity": []}
+    },
+    {
+      "id": "f2",
+      "text": "?team has a home ground ?stadium",
+      "rely_on": ["f1"],
+      "constraint": {"negation": null, "time": [], "quantity": []}
+    },
+    {
+      "id": "f3",
+      "text": "?stadium has a capacity",
+      "rely_on": ["f2"],
+      "constraint": {"negation": null, "time": [], "quantity": ["27,000"]}
+    }
+  ]
+}
+
+Output:
+{
+  "claim": "The capacity of the stadium that is the home ground of the team that Aamer Iqbal played for is 27,000.",
+  "decomposition_type": "quantified_or_comparative",
+  "question_items": [
+    {
+      "fact_id": "f1",
+      "main_question": "What team did Aamer Iqbal play for?",
+      "question_type": "entity_wh",
+      "constraint_questions": [],
+      "search_hints": ["Aamer Iqbal played for team", "Aamer Iqbal cricketer team"]
+    },
+    {
+      "fact_id": "f2",
+      "main_question": "What is the home ground of ?team?",
+      "question_type": "entity_wh",
+      "constraint_questions": [],
+      "search_hints": ["?team home ground", "?team stadium"]
+    },
+    {
+      "fact_id": "f3",
+      "main_question": "What is the capacity of ?stadium?",
+      "question_type": "quantity_wh",
+      "constraint_questions": [],
+      "search_hints": ["?stadium capacity", "?stadium 27000"]
+    }
+  ]
+}
+
+Example 2:
+Input decomposition:
+{
+  "claim": "The thesis supervisor of an individual was awarded the Eddington Medal in spring 1969.",
+  "decomposition_type": "nested",
+  "atomic_facts": [
+    {
+      "id": "f1",
+      "text": "The thesis supervisor of ?person was awarded the Eddington Medal",
+      "rely_on": [],
+      "constraint": {"negation": null, "time": ["spring 1969"], "quantity": []}
+    }
+  ]
+}
+
+Output:
+{
+  "claim": "The thesis supervisor of an individual was awarded the Eddington Medal in spring 1969.",
+  "decomposition_type": "nested",
+  "question_items": [
+    {
+      "fact_id": "f1",
+      "main_question": "When was the thesis supervisor of ?person awarded the Eddington Medal?",
+      "question_type": "time_wh",
+      "constraint_questions": [],
+      "search_hints": ["thesis supervisor Eddington Medal", "Eddington Medal 1969 thesis supervisor"]
+    }
+  ]
+}
+
+Example 3:
+Input decomposition:
+{
+  "claim": "The same person did not make Shore Things and Air Force Incorporated.",
+  "decomposition_type": "simple",
+  "atomic_facts": [
+    {
+      "id": "f1",
+      "text": "The same person made Shore Things and Air Force Incorporated",
+      "rely_on": [],
+      "constraint": {"negation": true, "time": [], "quantity": []}
+    }
+  ]
+}
+
+Output:
+{
+  "claim": "The same person did not make Shore Things and Air Force Incorporated.",
+  "decomposition_type": "simple",
+  "question_items": [
+    {
+      "fact_id": "f1",
+      "main_question": "Did the same person make Shore Things and Air Force Incorporated?",
+      "question_type": "relation_yesno",
+      "constraint_questions": [],
+      "search_hints": ["Shore Things director", "Air Force Incorporated director"]
+    }
+  ]
+}
+'''
+
+question_repair_prompt = """
+You are an expert checker for multi-hop fact verification question planning.
+
+You are given:
+1. a claim
+2. a decomposition result
+3. a current question plan
+4. detected issues
+
+Repair checklist:
+1. Each atomic fact must have exactly one main question.
+2. If a fact has a time constraint, prefer a WH time question as the main question.
+3. If a fact has a quantity constraint, prefer a WH quantity question as the main question.
+4. For negation, do not force WH questions.
+5. constraint_questions should usually be empty.
+6. Only keep optional extra constraint questions for time or quantity.
+7. search_hints should be concise and useful for retrieval.
+8. Return JSON only.
+
+claim: [CLAIM]
+decomposition: [DECOMPOSITION]
+current question plan: [QUESTION_PLAN]
+issues:
+[ISSUES]
+
+Return JSON only in this schema:
+{
+  "claim": "...",
+  "decomposition_type": "...",
+  "question_items": [
+    {
+      "fact_id": "f1",
+      "main_question": "... ?",
+      "question_type": "relation_yesno|entity_wh|time_wh|quantity_wh|description_wh",
+      "constraint_questions": [
+        {
+          "type": "time|quantity",
+          "question": "... ?"
+        }
+      ],
+      "search_hints": ["...", "..."]
+    }
+  ]
+}
+"""
+
+
+def get_question_prompt(claim, decomposition):
+    return (
+        question_instruct
+        + "\n"
+        + question_examples
+        + "\nClaim: "
+        + json.dumps(claim, ensure_ascii=False)
+        + "\nDecomposition:\n"
+        + json.dumps(decomposition, indent=2, ensure_ascii=False)
+        + "\nQuestion plan:"
+    )
+
+
+def get_question_repair_prompt(claim, decomposition, question_plan, issues):
+    return (
+        question_repair_prompt.replace('[CLAIM]', claim)
+        .replace('[DECOMPOSITION]', json.dumps(decomposition, indent=2, ensure_ascii=False))
+        .replace('[QUESTION_PLAN]', json.dumps(question_plan, indent=2, ensure_ascii=False))
+        .replace('[ISSUES]', '\n'.join(f'- {issue}' for issue in issues))
+    )
