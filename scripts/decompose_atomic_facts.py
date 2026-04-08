@@ -4,7 +4,7 @@ import json
 import argparse
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from datetime import datetime
 from tqdm import tqdm
 from openai import OpenAI
 
@@ -403,7 +403,7 @@ def main(args):
         json.dump(results, f, indent=4, ensure_ascii=False)
 
     print(f"Saved to {out_path}")
-
+    print("程序结束时间：", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

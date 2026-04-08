@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from tqdm import tqdm
+from datetime import datetime
 
 SUPPORTED = "support"
 CONTRADICTED = "contradict"
@@ -267,6 +268,7 @@ def main(args):
         json.dump(results, f, indent=4, ensure_ascii=False)
 
     print(f"Saved to {out_path}")
+    print("程序结束时间：", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 if __name__ == "__main__":

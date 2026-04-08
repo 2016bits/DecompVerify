@@ -8,6 +8,7 @@ from tqdm import tqdm
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
+from datetime import datetime
 
 from prompts.answer_prompts import get_answer_prompt
 
@@ -36,40 +37,6 @@ def build_client_and_model(plan, port='8370'):
         system_prompt = None
         extra_body = None
         max_tokens = None
-        temperature = 0.0
-        return client, model, system_prompt, extra_body, max_tokens, temperature
-
-    # 2) SCNet
-    elif plan in {"scnet", "scnet_qwen235b"}:
-        api_key = os.getenv("SCNET_API_KEY")
-        if not api_key:
-            raise ValueError("SCNET_API_KEY is not set in environment variables.")
-
-        client = OpenAI(
-            api_key=api_key,
-            base_url="https://api.scnet.cn/api/llm/v1"
-        )
-        model = "Qwen3-235B-A22B"
-        system_prompt = "You are a helpful assistant"
-        extra_body = None
-        max_tokens = 512
-        temperature = 0.0
-        return client, model, system_prompt, extra_body, max_tokens, temperature
-
-    # 3) iFlow
-    elif plan in {"iflow", "iflow_qwen32b"}:
-        api_key = os.getenv("IFLOW_API_KEY")
-        if not api_key:
-            raise ValueError("IFLOW_API_KEY is not set in environment variables.")
-
-        client = OpenAI(
-            base_url="https://apis.iflow.cn/v1",
-            api_key=api_key,
-        )
-        model = "qwen3-32b"
-        system_prompt = None
-        extra_body = {}
-        max_tokens = 512
         temperature = 0.0
         return client, model, system_prompt, extra_body, max_tokens, temperature
 
@@ -124,7 +91,7 @@ def build_client_and_model(plan, port='8370'):
     else:
         raise ValueError(
             f"Unsupported plan: {plan}. "
-            f"Supported plans are: local, scnet, iflow, scnet_qwen235b, iflow_qwen32b, azure, azure_gpt4o"
+            f"Supported plans are: local, azure, azure_gpt4o, qc_plan, qwen_plan"
         )
 
 
@@ -132,7 +99,7 @@ def llm(input_text, plan='local', port='8370'):
     client, model, system_prompt, extra_body, max_tokens, temperature = build_client_and_model(plan, port)
 
     # simple throttle to reduce 429 rate-limit errors
-    time.sleep(1.5)
+    # time.sleep(1.5)
 
     messages = []
     if system_prompt:
@@ -152,6 +119,8 @@ def llm(input_text, plan='local', port='8370'):
         kwargs["temperature"] = temperature
 
     response = client.chat.completions.create(**kwargs)
+    if plan.startswith('qc_plan') or plan.startswith('azure'):
+        time.sleep(1.2)
 
     if not response or not getattr(response, "choices", None):
         raise ValueError(f"Empty API response: {response}")
@@ -188,18 +157,14 @@ def llm(input_text, plan='local', port='8370'):
 def _clean_text(text):
     if text is None:
         return ""
-    text = str(text)
-    text = text.replace("\u2019", "'").replace("\u2018", "'")
-    text = text.replace("\u201c", '"').replace("\u201d", '"')
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", str(text)).strip()
 
 
 def extract_json_block(text):
     text = text.strip()
-    code_block_pattern = r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```"
-    match = re.search(code_block_pattern, text, flags=re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    m = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", text, flags=re.DOTALL)
+    if m:
+        return m.group(1).strip()
 
     first_brace = text.find("{")
     first_bracket = text.find("[")
@@ -283,8 +248,74 @@ def merge_bindings(current_bindings, new_bindings):
     return merged
 
 
-def normalize_answer_result(parsed, fact_id, used_question):
+def infer_answer_slot_from_question(question_item):
+    slot = question_item.get("answer_slot", None)
+    if slot:
+        return _clean_text(slot)
+
+    q = _clean_text(question_item.get("main_question", "")).lower()
+    mapping = [
+        (r"what team", "?team"),
+        (r"who is an ambassador", "?ambassador"),
+        (r"who is the ambassador", "?ambassador"),
+        (r"what is the home ground", "?home_ground"),
+        (r"which film", "?film"),
+        (r"what film", "?film"),
+        (r"what animal", "?animal"),
+        (r"where was .* born", "?village"),
+        (r"in which village .* born", "?village"),
+    ]
+    for pat, slot in mapping:
+        if re.search(pat, q):
+            return slot
+    return None
+
+
+def normalize_yesno_by_question_type(question_type, answer, evidence_span):
+    answer = _clean_text(answer)
+    lower = answer.lower()
+
+    if question_type == "relation_yesno":
+        if lower in {"yes", "no"}:
+            return answer
+        if lower.startswith("yes"):
+            return "Yes"
+        if lower.startswith("no"):
+            return "No"
+        if answer and evidence_span and lower != "insufficient":
+            return "Yes"
+
+    return answer
+
+
+def normalize_bindings_update(parsed, question_item, question_type, answer):
+    bindings_update = parsed.get("bindings_update", {})
+    if not isinstance(bindings_update, dict):
+        bindings_update = {}
+
+    answer_slot = infer_answer_slot_from_question(question_item)
+    if question_type == "entity_wh" and answer_slot and _clean_text(answer).lower() != "insufficient":
+        bindings_update.setdefault(answer_slot, _clean_text(answer))
+
+        if answer_slot == "?home_ground":
+            bindings_update.setdefault("?stadium", _clean_text(answer))
+        if answer_slot == "?stadium":
+            bindings_update.setdefault("?home_ground", _clean_text(answer))
+
+    q_l = _clean_text(question_item.get("main_question", "")).lower()
+    if "ambassador" in q_l and _clean_text(answer).lower() != "insufficient":
+        bindings_update.setdefault("?ambassador", _clean_text(answer))
+    if "what team" in q_l and _clean_text(answer).lower() != "insufficient":
+        bindings_update.setdefault("?team", _clean_text(answer))
+
+    return bindings_update
+
+
+def normalize_answer_result(parsed, fact_id, used_question, question_item):
     answer = _clean_text(parsed.get("answer", "insufficient"))
+    question_type = _clean_text(question_item.get("question_type", ""))
+    answer = normalize_yesno_by_question_type(question_type, answer, parsed.get("evidence_span", ""))
+
     status_raw = _clean_text(parsed.get("status", "insufficient")).lower()
     status_map = {
         "support": "supported",
@@ -297,9 +328,7 @@ def normalize_answer_result(parsed, fact_id, used_question):
     }
     status = status_map.get(status_raw, "insufficient")
     evidence_span = _clean_text(parsed.get("evidence_span", ""))
-    bindings_update = parsed.get("bindings_update", {})
-    if not isinstance(bindings_update, dict):
-        bindings_update = {}
+    bindings_update = normalize_bindings_update(parsed, question_item, question_type, answer)
 
     return {
         "fact_id": fact_id,
@@ -321,6 +350,11 @@ def validate_answer_result(result, fact_id):
     return True
 
 
+def is_rate_limit_error(e):
+    msg = str(e)
+    return "429" in msg or "频率超限" in msg or "rate limit" in msg.lower()
+
+
 def fallback_answer_result(fact_id, used_question, error_type="api_error"):
     return {
         "fact_id": fact_id,
@@ -330,11 +364,6 @@ def fallback_answer_result(fact_id, used_question, error_type="api_error"):
         "evidence_span": "",
         "bindings_update": {},
     }
-
-
-def is_rate_limit_error(e):
-    msg = str(e)
-    return "429" in msg or "频率超限" in msg or "rate limit" in msg.lower()
 
 
 def answer_one_question(claim, evidence, atomic_fact, question_item, current_bindings, plan, port):
@@ -357,7 +386,7 @@ def answer_one_question(claim, evidence, atomic_fact, question_item, current_bin
             )
             output = llm(prompt, plan=plan, port=port)
             parsed = parse_answer_output(output)
-            result = normalize_answer_result(parsed, fact_id, used_question)
+            result = normalize_answer_result(parsed, fact_id, used_question, filled_question_item)
             validate_answer_result(result, fact_id)
             return result
         except Exception as e:
@@ -404,6 +433,7 @@ def generate_answers_for_item(data, plan, port):
             "text": qitem.get("fact_text", ""),
             "rely_on": qitem.get("rely_on", []),
             "constraint": qitem.get("constraint", {}),
+            "critical": qitem.get("critical", False),
         })
 
         result = answer_one_question(
@@ -420,7 +450,7 @@ def generate_answers_for_item(data, plan, port):
         final_bindings = merge_bindings(final_bindings, result.get("bindings_update", {}))
 
         still_unresolved = unresolved_vars(result.get("question", ""))
-        if still_unresolved:
+        if still_unresolved and result.get("status") in {"insufficient", "api_error"}:
             answer_issues.append(
                 f"Question for {fact_id} still has unresolved variables after answering: {still_unresolved}"
             )
@@ -433,21 +463,8 @@ def generate_answers_for_item(data, plan, port):
 
 
 def process_data_item(data, plan, port):
-    decomposition = data.get("decomposition", None)
-    question_plan = data.get("question_plan", None)
-
-    if decomposition is None and "atomic_facts" in data and isinstance(data["atomic_facts"], dict):
-        decomposition = data["atomic_facts"]
-
-    if decomposition is None:
-        decomposition = {
-            "claim": data["claim"],
-            "atomic_facts": [],
-            "constraints": []
-        }
-
-    if question_plan is None:
-        question_plan = {"question_items": []}
+    decomposition = data.get("decomposition", {"claim": data["claim"], "atomic_facts": []})
+    question_plan = data.get("question_plan", {"question_items": []})
 
     answer_result, answer_issues = generate_answers_for_item(
         {
@@ -470,10 +487,7 @@ def process_data_item(data, plan, port):
         "question_plan": question_plan,
         "answer_result": answer_result,
         "answer_issues": answer_issues,
-        "answer_used_fallback": any(
-            x["status"] == "insufficient" and x["answer"] == "insufficient" and not x["evidence_span"]
-            for x in answer_result["answers"]
-        ),
+        "answer_used_fallback": any(x["status"] == "api_error" for x in answer_result["answers"]),
     }
 
 
@@ -494,30 +508,14 @@ def main(args):
 
     dataset = []
     for data in raws:
-        decomposition = data.get("decomposition", None)
-        question_plan = data.get("question_plan", None)
-
-        if decomposition is None and "atomic_facts" in data and isinstance(data["atomic_facts"], dict):
-            decomposition = data["atomic_facts"]
-
-        if decomposition is None:
-            decomposition = {
-                "claim": data["claim"],
-                "atomic_facts": [],
-                "constraints": []
-            }
-
-        if question_plan is None:
-            question_plan = {"question_items": []}
-
         dataset.append({
             "id": data["id"],
             "claim": data["claim"],
             "gold_evidence": data.get("gold_evidence", data.get("evidence", "")),
             "num_hops": data.get("num_hops", None),
             "label": data.get("label", None),
-            "decomposition": decomposition,
-            "question_plan": question_plan
+            "decomposition": data.get("decomposition", {"claim": data["claim"], "atomic_facts": []}),
+            "question_plan": data.get("question_plan", {"question_items": []})
         })
 
     partial_func = partial(process_data_item, plan=args.plan, port=args.port)
@@ -554,32 +552,21 @@ def main(args):
         json.dump(results, f, indent=4, ensure_ascii=False)
 
     print(f"Saved to {out_path}")
+    print("程序结束时间：", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='HOVER', help='Dataset name')
-    parser.add_argument('--data_type', type=str, default='dev', help='Data type: train/dev/test')
-    parser.add_argument('--class_num', type=str, default='2', help='Number of classes: 2/3')
-    parser.add_argument('--start', type=int, default=0, help='Start index')
-    parser.add_argument('--end', type=int, default=200, help='End index')
-    parser.add_argument('--port', type=str, default='8370', help='Port for local LLM API')
-    parser.add_argument('--max_workers', type=int, default=8, help='Number of threads')
-    parser.add_argument('--plan', type=str, default='local', help='LLM plan: local/scnet/iflow/azure')
-
-    parser.add_argument(
-        '--in_path',
-        type=str,
-        default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_question_[T][S]_[E].json',
-        help='Input path template'
-    )
-    parser.add_argument(
-        '--out_path',
-        type=str,
-        default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_answer_[T][S]_[E].json',
-        help='Output path template'
-    )
+    parser.add_argument('--dataset', type=str, default='HOVER')
+    parser.add_argument('--data_type', type=str, default='dev')
+    parser.add_argument('--class_num', type=str, default='2')
+    parser.add_argument('--start', type=int, default=0)
+    parser.add_argument('--end', type=int, default=200)
+    parser.add_argument('--port', type=str, default='8370')
+    parser.add_argument('--max_workers', type=int, default=8)
+    parser.add_argument('--plan', type=str, default='local')
+    parser.add_argument('--in_path', type=str, default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_question_[T][S]_[E].json')
+    parser.add_argument('--out_path', type=str, default='./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_answer_[T][S]_[E].json')
     parser.add_argument('--t', type=str, default='')
-
     args = parser.parse_args()
     main(args)
