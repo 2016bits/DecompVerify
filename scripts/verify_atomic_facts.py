@@ -11,11 +11,117 @@ from datetime import datetime
 
 VAR_PATTERN = re.compile(r"\?[A-Za-z_][A-Za-z0-9_]*")
 
+NEGATION_CUE_PATTERNS = [
+    r"\bnot\b",
+    r"\bno\b",
+    r"\bno longer\b",
+    r"\bnever\b",
+    r"\bwithout\b",
+    r"\bfail(?:ed|s|ing)?\b",
+    r"\bunsuccessful(?:ly)?\b",
+    r"\bunable\b",
+    r"\bunaware\b",
+    r"\black(?:s|ed|ing)?\b",
+    r"\babsence\b",
+]
+
+MONTH_TO_NUM = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+STOPWORD_TOKENS = {
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "from", "by", "with",
+}
+
+GENERIC_LOCATION_TOKENS = {
+    "country", "region", "area", "province", "state", "city", "town",
+    "village", "county", "district", "place",
+}
+
+DIRECTION_TOKENS = {
+    "north", "south", "east", "west",
+    "northern", "southern", "eastern", "western",
+    "northeast", "northwest", "southeast", "southwest",
+    "northeastern", "northwestern", "southeastern", "southwestern",
+}
+
+NUMBER_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+
+SCALE_WORDS = {
+    "hundred": 100,
+    "thousand": 1000,
+}
+
+ORDINAL_WORDS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+    "eleventh": 11,
+    "twelfth": 12,
+    "thirteenth": 13,
+    "fourteenth": 14,
+    "fifteenth": 15,
+    "sixteenth": 16,
+    "seventeenth": 17,
+    "eighteenth": 18,
+    "nineteenth": 19,
+    "twentieth": 20,
+}
+
+
 
 def _clean_text(text):
     if text is None:
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
+
 
 
 def normalize_text_for_match(text):
@@ -24,6 +130,26 @@ def normalize_text_for_match(text):
     text = re.sub(r"\b(the|a|an)\b", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+
+def normalize_semantic_text(text):
+    text = normalize_text_for_match(text)
+    text = text.replace("all year round", "year round")
+    text = text.replace("all year-round", "year round")
+    text = text.replace("all-year round", "year round")
+    text = text.replace("all-year-round", "year round")
+    text = text.replace("year-round", "year round")
+    return text
+
+
+
+def contains_explicit_negation(text):
+    text_l = _clean_text(text).lower()
+    if not text_l:
+        return False
+    return any(re.search(pattern, text_l) for pattern in NEGATION_CUE_PATTERNS)
+
 
 
 def replace_placeholders(text, bindings):
@@ -42,8 +168,10 @@ def replace_placeholders(text, bindings):
     return text
 
 
+
 def unresolved_vars(text):
     return sorted(set(VAR_PATTERN.findall(_clean_text(text))))
+
 
 
 def normalize_status(status):
@@ -57,6 +185,7 @@ def normalize_status(status):
     return "insufficient"
 
 
+
 def normalize_yesno(answer):
     a = _clean_text(answer).lower()
     if a in {"yes", "yes.", "true"}:
@@ -66,54 +195,343 @@ def normalize_yesno(answer):
     return None
 
 
+
 def contains_negation(fact):
     return (fact.get("constraint", {}) or {}).get("negation") is True
 
 
+
 def extract_years(text):
-    return re.findall(r"\b(1[0-9]{3}|20[0-9]{2}|2100)\b", _clean_text(text))
+    return re.findall(r"\b([1-9][0-9]{2,3})\b", _clean_text(text))
+
+
+
+def extract_dates(text):
+    month_regex = "|".join(MONTH_TO_NUM.keys())
+    text = _clean_text(text)
+    patterns = [
+        re.compile(rf"\b(?P<day>\d{{1,2}})\s+(?P<month>{month_regex})\s+(?P<year>\d{{3,4}})\b", re.IGNORECASE),
+        re.compile(rf"\b(?P<month>{month_regex})\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*|\s+)(?P<year>\d{{3,4}})\b", re.IGNORECASE),
+    ]
+
+    dates = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            month = match.group("month").lower()
+            dates.append((int(match.group("year")), MONTH_TO_NUM[month], int(match.group("day"))))
+    return dates
+
+
+
+def extract_month_numbers(text):
+    text_l = _clean_text(text).lower()
+    return sorted({num for month, num in MONTH_TO_NUM.items() if re.search(rf"\b{month}\b", text_l)})
+
+
+
+def is_year_only_text(text):
+    text_l = _clean_text(text).lower()
+    text_l = re.sub(r"\b[1-9][0-9]{2,3}\b", " ", text_l)
+    text_l = re.sub(r"\b(ad|ce|bc|bce)\b", " ", text_l)
+    text_l = re.sub(r"[^a-z]", " ", text_l)
+    return not re.sub(r"\s+", "", text_l)
+
+
+
+def extract_decade_range(text):
+    text_l = _clean_text(text).lower()
+    match = re.search(r"\b(?:(early|mid|late)\s+)?([1-9][0-9]{2,3})s\b", text_l)
+    if not match:
+        return None
+
+    modifier = match.group(1)
+    start = int(match.group(2))
+    span = 100 if start % 100 == 0 else 10
+    end = start + span - 1
+
+    if modifier == "early":
+        end = start + (39 if span == 100 else 3)
+    elif modifier == "mid":
+        start = start + (30 if span == 100 else 3)
+        end = start + (39 if span == 100 else 3)
+    elif modifier == "late":
+        start = start + (70 if span == 100 else 7)
+
+    return start, end
+
+
+
+def time_match(answer, times):
+    ans = normalize_semantic_text(answer)
+    tvals = [_clean_text(x) for x in (times or []) if _clean_text(x)]
+    if not tvals:
+        return None
+
+    answer_dates = extract_dates(answer)
+    answer_months = extract_month_numbers(answer)
+    answer_years = [int(x) for x in extract_years(answer)]
+    saw_conflict = False
+
+    for t in tvals:
+        t_norm = normalize_semantic_text(t)
+        if t_norm and (t_norm in ans or ans in t_norm):
+            return True
+
+        t_dates = extract_dates(t)
+        if t_dates:
+            if answer_dates:
+                if any(ad == td for ad in answer_dates for td in t_dates):
+                    return True
+                saw_conflict = True
+            continue
+
+        t_months = extract_month_numbers(t)
+        t_years = [int(x) for x in extract_years(t)]
+
+        if t_months and t_years:
+            if answer_months and answer_years:
+                if any(m in t_months for m in answer_months) and any(y in t_years for y in answer_years):
+                    return True
+                saw_conflict = True
+            continue
+
+        decade_range = extract_decade_range(t)
+        if decade_range and answer_years:
+            start, end = decade_range
+            if any(start <= year <= end for year in answer_years):
+                return True
+            saw_conflict = True
+            continue
+
+        if t_years and answer_years:
+            if is_year_only_text(t):
+                if any(year in t_years for year in answer_years):
+                    return True
+                saw_conflict = True
+                continue
+
+            if set(answer_years) == set(t_years):
+                return True
+            saw_conflict = True
+
+    return False if saw_conflict else None
+
 
 
 def normalize_num_string(s):
-    return _clean_text(s).lower().replace(",", "").strip()
+    return _clean_text(s).lower().replace(",", "").replace("-", " ").strip()
+
+
+
+def tokenize_number_words(text):
+    text = normalize_num_string(text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    return [tok for tok in text.split() if tok]
+
+
+
+def consume_number_tokens(tokens, start):
+    total = 0
+    current = 0
+    used = 0
+    found = False
+
+    while start + used < len(tokens):
+        tok = tokens[start + used]
+        if tok in NUMBER_WORDS:
+            current += NUMBER_WORDS[tok]
+            found = True
+        elif tok in SCALE_WORDS:
+            current = max(1, current) * SCALE_WORDS[tok]
+            if SCALE_WORDS[tok] >= 1000:
+                total += current
+                current = 0
+            found = True
+        elif tok in ORDINAL_WORDS:
+            current += ORDINAL_WORDS[tok]
+            found = True
+            used += 1
+            break
+        elif tok == "and" and found:
+            used += 1
+            continue
+        else:
+            break
+        used += 1
+
+    if not found:
+        return None, 0
+    return total + current, used
+
+
+
+def extract_numeric_values(text):
+    text = normalize_num_string(text)
+    values = []
+
+    for match in re.findall(r"\b(\d+)(?:st|nd|rd|th)?\b", text.lower()):
+        values.append(int(match))
+
+    tokens = tokenize_number_words(text)
+    idx = 0
+    while idx < len(tokens):
+        value, used = consume_number_tokens(tokens, idx)
+        if used:
+            values.append(value)
+            idx += used
+        else:
+            idx += 1
+
+    deduped = []
+    for value in values:
+        if value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+
+def parse_quantity_comparator(text):
+    text = normalize_num_string(text)
+    number_token = r"(?:\d+(?:st|nd|rd|th)?|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth)"
+    number_phrase = rf"(?P<num>{number_token}(?:\s+(?:and\s+)?{number_token}){{0,4}})"
+    patterns = [
+        (rf"\b(?:more than|over|greater than|above)\s+{number_phrase}\b", ">"),
+        (rf"\b(?:at least|no fewer than|minimum of)\s+{number_phrase}\b", ">="),
+        (rf"\b(?:at most|no more than|up to|maximum of)\s+{number_phrase}\b", "<="),
+        (rf"\b(?:less than|under|below|fewer than)\s+{number_phrase}\b", "<"),
+    ]
+    for pattern, op in patterns:
+        match = re.search(pattern, text)
+        if match:
+            nums = extract_numeric_values(match.group("num"))
+            if nums:
+                return op, nums[0]
+    return None
+
+
+
+def compare_numeric(value, op, target):
+    if op == ">":
+        return value > target
+    if op == ">=":
+        return value >= target
+    if op == "<":
+        return value < target
+    if op == "<=":
+        return value <= target
+    return value == target
+
+
+
+def infer_quantity_targets_from_fact(fact_text):
+    fact_text = _clean_text(fact_text)
+    fact_l = fact_text.lower()
+    if re.search(
+        r"\b(multiple|several|many|numerous|various|different|majority|more popular|less popular|grew|grown|growing|increase|increased|decrease|decreased|over|under|at least|at most|less than|more than|fewer than)\b",
+        fact_l,
+    ):
+        return [fact_text]
+    if re.search(r"\b\d+(?:st|nd|rd|th)?\b", fact_l):
+        return [fact_text]
+    if any(word in fact_l for word in list(NUMBER_WORDS.keys()) + list(ORDINAL_WORDS.keys())):
+        return [fact_text]
+    return []
+
+
+
+def qualitative_quantity_match(fact_norm, answer_norm, answer_numbers):
+    plural_synonyms = {"multiple", "several", "many", "numerous", "various", "different"}
+
+    if "multiple" in fact_norm:
+        if any(num >= 2 for num in answer_numbers) or any(word in answer_norm for word in plural_synonyms):
+            return True
+        if any(num == 1 for num in answer_numbers):
+            return False
+
+    if "several" in fact_norm:
+        if any(num >= 3 for num in answer_numbers) or any(word in answer_norm for word in {"several", "many", "numerous"}):
+            return True
+        if answer_numbers and all(num < 3 for num in answer_numbers):
+            return False
+
+    if re.search(r"\b(many|numerous)\b", fact_norm):
+        if any(num >= 3 for num in answer_numbers) or any(word in answer_norm for word in {"many", "numerous", "several"}):
+            return True
+
+    if re.search(r"\b(various|different)\b", fact_norm):
+        if any(num >= 2 for num in answer_numbers) or any(word in answer_norm for word in {"various", "different", "several", "multiple"}):
+            return True
+
+    if "majority" in fact_norm:
+        if "majority" in answer_norm:
+            return True
+        if "minority" in answer_norm:
+            return False
+
+    if re.search(r"\b(more popular|grew|grown|growing|increase|increased|higher|greater)\b", fact_norm):
+        if re.search(r"\b(grow|grew|grown|growing|increase|increased|increasing|rose|risen|higher|greater|more)\b", answer_norm):
+            return True
+        if re.search(r"\b(decrease|decreased|decline|declined|less|lower)\b", answer_norm):
+            return False
+
+    if re.search(r"\b(less popular|decrease|decreased|lower|fewer|smaller)\b", fact_norm):
+        if re.search(r"\b(decrease|decreased|decline|declined|less|lower|fewer|smaller)\b", answer_norm):
+            return True
+        if re.search(r"\b(grow|grew|grown|increase|increased|more|higher|greater)\b", answer_norm):
+            return False
+
+    return None
+
 
 
 def quantity_match(answer, quantities, fact_text=""):
     ans = normalize_num_string(answer)
     qvals = [normalize_num_string(x) for x in (quantities or []) if _clean_text(x)]
-
-    if not qvals:
-        if re.search(r"\beight\b", fact_text.lower()):
-            qvals = ["eight"]
-        elif re.search(r"\b27[, ]?000\b", fact_text):
-            qvals = ["27000"]
+    qvals.extend(normalize_num_string(x) for x in infer_quantity_targets_from_fact(fact_text))
 
     if not qvals:
         return None
+
+    deduped_qvals = []
+    for q in qvals:
+        if q and q not in deduped_qvals:
+            deduped_qvals.append(q)
+    qvals = deduped_qvals
+
+    answer_numbers = extract_numeric_values(answer)
+    answer_comparator = parse_quantity_comparator(answer)
+    saw_conflict = False
 
     for q in qvals:
-        if q and (q in ans or ans in q):
-            return True
-    return False
-
-
-def time_match(answer, times):
-    ans = _clean_text(answer).lower()
-    tvals = [_clean_text(x).lower() for x in (times or []) if _clean_text(x)]
-    if not tvals:
-        return None
-
-    for t in tvals:
-        if t and (t in ans or ans in t):
-            return True
-
-    ans_years = set(extract_years(ans))
-    if ans_years:
-        for t in tvals:
-            t_years = set(extract_years(t))
-            if t_years and ans_years == t_years:
+        comparator = parse_quantity_comparator(q)
+        if comparator:
+            if answer_comparator == comparator:
                 return True
-    return False
+            if answer_numbers:
+                op, target = comparator
+                if any(compare_numeric(num, op, target) for num in answer_numbers):
+                    return True
+                saw_conflict = True
+                continue
+
+        q_numbers = extract_numeric_values(q)
+        if q_numbers and answer_numbers:
+            if any(a == qn for a in answer_numbers for qn in q_numbers):
+                return True
+            saw_conflict = True
+            continue
+
+        if ans and (ans in q or q in ans):
+            return True
+
+        qualitative = qualitative_quantity_match(q, ans, answer_numbers)
+        if qualitative is True:
+            return True
+        if qualitative is False:
+            saw_conflict = True
+
+    return False if saw_conflict else None
+
 
 
 def span_grounded_in_evidence(evidence_span, gold_evidence):
@@ -134,12 +552,42 @@ def span_grounded_in_evidence(evidence_span, gold_evidence):
     return overlap >= 0.7
 
 
+
+def content_tokens(text):
+    return [tok for tok in normalize_text_for_match(text).split() if tok and tok not in STOPWORD_TOKENS]
+
+
+
+def directional_location_match(a, b):
+    a_tokens = set(content_tokens(a))
+    b_tokens = set(content_tokens(b))
+    if not a_tokens or not b_tokens:
+        return False
+
+    shared_directions = (a_tokens & b_tokens) & DIRECTION_TOKENS
+    if not shared_directions:
+        return False
+
+    a_core = a_tokens - GENERIC_LOCATION_TOKENS
+    b_core = b_tokens - GENERIC_LOCATION_TOKENS
+    if a_core <= shared_directions or b_core <= shared_directions:
+        return True
+
+    if "country" in a_tokens or "country" in b_tokens:
+        return True
+
+    return False
+
+
+
 def text_match_loose(a, b):
     a_n = normalize_text_for_match(a)
     b_n = normalize_text_for_match(b)
     if not a_n or not b_n:
         return False
     if a_n == b_n or a_n in b_n or b_n in a_n:
+        return True
+    if directional_location_match(a, b):
         return True
 
     a_tokens = set(a_n.split())
@@ -151,23 +599,29 @@ def text_match_loose(a, b):
     return overlap >= 0.75
 
 
+
 def extract_entity_target_from_fact(fact_text):
     text = _clean_text(fact_text)
 
     strict_patterns = [
         r"\bwas born in\s+(.+?)[\.\,]?$",
         r"\bshown on\s+(.+?)[\.\,]?$",
+        r"\blocated in the\s+(.+?)[\.\,]?$",
         r"\blocated in\s+(.+?)[\.\,]?$",
+        r"\bwas located in\s+(.+?)[\.\,]?$",
         r"\btook place in\s+(.+?)[\.\,]?$",
-        r"\bis in\s+([A-Z][A-Za-z0-9 ,\-]+)[\.\,]?$",
+        r"\bcan only be used in\s+(.+?)[\.\,]?$",
+        r"\bknown by\s+(.+?)[\.\,]?$",
+        r"\bis in\s+([A-Z][A-Za-z0-9 ,\-/]+)[\.\,]?$",
     ]
-    for p in strict_patterns:
-        m = re.search(p, text, flags=re.IGNORECASE)
-        if m:
-            cand = _clean_text(m.group(1))
+    for pattern in strict_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            cand = _clean_text(match.group(1))
             if cand and cand.lower() not in {"a village", "a town", "a city", "a television sitcom", "a film", "an animal"}:
                 return cand
     return ""
+
 
 
 def is_existential_or_type_fact(fact_text):
@@ -184,32 +638,40 @@ def is_existential_or_type_fact(fact_text):
         "played for a team",
         "has a star",
     ]
-    return any(p in t for p in patterns)
+    return any(pattern in t for pattern in patterns)
+
 
 
 def verify_entity_wh(fact, answer, answer_status, evidence_span, gold_evidence):
     fact_text = _clean_text(fact.get("text", ""))
+    grounded = span_grounded_in_evidence(evidence_span, gold_evidence)
+    target = extract_entity_target_from_fact(fact_text)
 
-    if answer_status == "contradicted":
-        return "contradict", "The answer result contradicts the fact."
+    answer_text = _clean_text(answer)
+    answer_missing = answer_status in {"insufficient", "api_error"} or answer_text.lower() == "insufficient" or not answer_text
+    candidate = answer_text
 
-    if answer_status in {"insufficient", "api_error"} or _clean_text(answer).lower() == "insufficient":
+    if answer_missing and grounded and target and text_match_loose(evidence_span, target):
+        candidate = _clean_text(evidence_span)
+        answer_missing = False
+
+    if answer_missing:
         return "insufficient", "The answer does not provide enough information."
 
-    target = extract_entity_target_from_fact(fact_text)
-    grounded = span_grounded_in_evidence(evidence_span, gold_evidence)
-
     if is_existential_or_type_fact(fact_text) or not target:
-        if grounded and _clean_text(answer):
+        if answer_status == "contradicted":
+            return "contradict", "The answer result contradicts the fact."
+        if grounded and candidate:
             return "support", "The answer provides a grounded value for the fact."
         return "insufficient", "The answer is not sufficiently grounded in the evidence."
 
-    if text_match_loose(answer, target):
-        if grounded:
+    if text_match_loose(candidate, target):
+        if grounded or span_grounded_in_evidence(candidate, gold_evidence):
             return "support", "The answer matches the target value and is grounded in the evidence."
         return "insufficient", "The answer matches the target value but is not grounded enough."
 
     return "contradict", "The answer conflicts with the target value in the atomic fact."
+
 
 
 def build_maps(data):
@@ -228,6 +690,7 @@ def build_maps(data):
         {a.get("fact_id"): a for a in answers},
         final_bindings,
     )
+
 
 
 def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
@@ -270,18 +733,19 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
 
     if question_type == "relation_yesno":
         yn = normalize_yesno(answer)
-        if answer_status == "contradicted":
-            yn = "no" if yn is None else yn
+        if answer_status == "contradicted" and yn is None:
+            yn = "no"
 
         if answer_status in {"insufficient", "api_error"} or yn is None:
             verification_label = "insufficient"
             reason = "The answer does not clearly determine the fact."
         else:
+            reverse_polarity = negated and not contains_explicit_negation(bound_question or question or raw_fact_text)
             if yn == "yes":
-                verification_label = "contradict" if negated else "support"
+                verification_label = "contradict" if reverse_polarity else "support"
                 reason = "The answer affirms the fact."
             else:
-                verification_label = "support" if negated else "contradict"
+                verification_label = "support" if reverse_polarity else "contradict"
                 reason = "The answer denies the fact."
 
         if verification_label == "support" and not span_grounded_in_evidence(evidence_span, gold_evidence):
@@ -294,30 +758,36 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
 
     elif question_type == "time_wh":
         matched = time_match(answer, constraint.get("time", []))
-        if answer_status in {"insufficient", "api_error"}:
-            verification_label = "insufficient"
-            reason = "The answer does not provide enough temporal information."
-        elif matched is True:
+        if matched is None and evidence_span:
+            matched = time_match(evidence_span, constraint.get("time", []))
+
+        if matched is True:
             verification_label = "contradict" if negated else "support"
             reason = "The answer matches the time constraint."
         elif matched is False and constraint.get("time"):
             verification_label = "support" if negated else "contradict"
             reason = "The answer conflicts with the time constraint."
+        elif answer_status in {"insufficient", "api_error"}:
+            verification_label = "insufficient"
+            reason = "The answer does not provide enough temporal information."
         else:
             verification_label = "insufficient"
             reason = "The answer does not determine the time constraint."
 
     elif question_type == "quantity_wh":
         matched = quantity_match(answer, constraint.get("quantity", []), raw_fact_text)
-        if answer_status in {"insufficient", "api_error"}:
-            verification_label = "insufficient"
-            reason = "The answer does not provide enough quantity information."
-        elif matched is True:
+        if matched is None and evidence_span:
+            matched = quantity_match(evidence_span, constraint.get("quantity", []), raw_fact_text)
+
+        if matched is True:
             verification_label = "contradict" if negated else "support"
             reason = "The answer matches the quantity constraint."
-        elif matched is False and (constraint.get("quantity") or re.search(r"\beight\b|\b27[, ]?000\b", raw_fact_text.lower())):
+        elif matched is False:
             verification_label = "support" if negated else "contradict"
             reason = "The answer conflicts with the quantity constraint."
+        elif answer_status in {"insufficient", "api_error"}:
+            verification_label = "insufficient"
+            reason = "The answer does not provide enough quantity information."
         else:
             verification_label = "insufficient"
             reason = "The answer does not determine the quantity constraint."
@@ -328,7 +798,7 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
             answer=answer,
             answer_status=answer_status,
             evidence_span=evidence_span,
-            gold_evidence=gold_evidence
+            gold_evidence=gold_evidence,
         )
 
     else:
@@ -363,6 +833,7 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
     }
 
 
+
 def process_data_item(data):
     fact_map, q_map, a_map, final_bindings = build_maps(data)
     ordered_fact_ids = [f.get("id") for f in (data.get("decomposition", {}) or {}).get("atomic_facts", []) or []]
@@ -388,9 +859,10 @@ def process_data_item(data):
         "fact_verification": {
             "claim": data["claim"],
             "final_bindings": final_bindings,
-            "verifications": fact_verification
-        }
+            "verifications": fact_verification,
+        },
     }
+
 
 
 def main(args):
@@ -441,7 +913,7 @@ def main(args):
         json.dump(results, f, indent=4, ensure_ascii=False)
 
     print(f"Saved to {out_path}")
-    print("程序结束时间：", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("Program finished at:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 if __name__ == "__main__":
@@ -458,12 +930,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--in_path",
         type=str,
-        default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_answer_[T][S]_[E].json"
+        default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_answer_[T][S]_[E].json",
     )
     parser.add_argument(
         "--out_path",
         type=str,
-        default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_verify_[T][S]_[E].json"
+        default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_verify_[T][S]_[E].json",
     )
 
     args = parser.parse_args()
