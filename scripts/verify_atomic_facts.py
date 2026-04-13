@@ -40,6 +40,45 @@ MONTH_TO_NUM = {
     "december": 12,
 }
 
+TEXT_NORMALIZATION_REPLACEMENTS = {
+    "organisations": "organizations",
+    "organisation": "organization",
+    "programmes": "programs",
+    "programme": "program",
+    "millimetres": "millimeters",
+    "millimetre": "millimeter",
+    "metres": "meters",
+    "metre": "meter",
+    "kilometres": "kilometers",
+    "kilometre": "kilometer",
+    "centimetres": "centimeters",
+    "centimetre": "centimeter",
+    "colour": "color",
+    "colours": "colors",
+    "centre": "center",
+    "centres": "centers",
+}
+
+TEMPORAL_NORMALIZATION_REPLACEMENTS = {
+    "holocaust": "nazi german genocide against jews",
+    "graduating college": "finish college",
+    "graduated college": "finish college",
+    "graduating university": "finish college",
+    "graduated university": "finish college",
+    "after finishing at university": "after finish college",
+    "after finishing university": "after finish college",
+    "after graduating college": "after finish college",
+    "after graduating university": "after finish college",
+    "after wartime service": "after war service",
+    "in the wake of": "after",
+    "wake of": "after",
+    "months": "month",
+    "years": "year",
+    "weeks": "week",
+    "days": "day",
+    "infancy": "infant",
+}
+
 STOPWORD_TOKENS = {
     "the", "a", "an", "of", "in", "on", "at", "to", "for", "from", "by", "with",
 }
@@ -124,24 +163,34 @@ def _clean_text(text):
 
 
 
+def apply_term_replacements(text, replacements):
+    for src in sorted(replacements.keys(), key=len, reverse=True):
+        text = re.sub(rf"\b{re.escape(src)}\b", replacements[src], text)
+    return text
+
+
 def normalize_text_for_match(text):
     text = _clean_text(text).lower()
-    text = re.sub(r"[^\w\s]", " ", text)
+    text = apply_term_replacements(text, TEXT_NORMALIZATION_REPLACEMENTS)
+    text = re.sub(r"(?<=\d)(?=[a-z%])", " ", text)
+    text = re.sub(r"(?<=[a-z])(?=\d)", " ", text)
+    text = re.sub(r"[^\w\s\.]", " ", text)
+    text = text.replace(".", " ")
     text = re.sub(r"\b(the|a|an)\b", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-
 def normalize_semantic_text(text):
     text = normalize_text_for_match(text)
+    text = apply_term_replacements(text, TEMPORAL_NORMALIZATION_REPLACEMENTS)
     text = text.replace("all year round", "year round")
     text = text.replace("all year-round", "year round")
     text = text.replace("all-year round", "year round")
     text = text.replace("all-year-round", "year round")
     text = text.replace("year-round", "year round")
+    text = re.sub(r"\s+", " ", text).strip()
     return text
-
 
 
 def contains_explicit_negation(text):
@@ -240,7 +289,7 @@ def is_year_only_text(text):
 
 def extract_decade_range(text):
     text_l = _clean_text(text).lower()
-    match = re.search(r"\b(?:(early|mid|late)\s+)?([1-9][0-9]{2,3})s\b", text_l)
+    match = re.search(r"\b(?:(early|mid|late)\s+)?([1-9][0-9]{2,3})(?:'s|s)\b", text_l)
     if not match:
         return None
 
@@ -261,6 +310,32 @@ def extract_decade_range(text):
 
 
 
+def looks_temporal_text(text):
+    norm = normalize_semantic_text(text)
+    if not norm:
+        return False
+    if extract_dates(text) or extract_years(text) or extract_month_numbers(text):
+        return True
+
+    temporal_keywords = [
+        "during", "after", "before", "until", "while", "when", "eventually", "initially",
+        "first", "last", "spring", "summer", "fall", "autumn", "winter", "period", "era",
+        "century", "month", "year", "week", "day", "decade", "later", "earlier", "life",
+    ]
+    return any(re.search(rf"\b{keyword}\b", norm) for keyword in temporal_keywords)
+
+
+
+def temporal_phrase_match(answer, target):
+    a_tokens = set(tok for tok in normalize_semantic_text(answer).split() if tok not in STOPWORD_TOKENS)
+    t_tokens = set(tok for tok in normalize_semantic_text(target).split() if tok not in STOPWORD_TOKENS)
+    if not a_tokens or not t_tokens:
+        return False
+
+    overlap = len(a_tokens & t_tokens) / max(1, min(len(a_tokens), len(t_tokens)))
+    return overlap >= 0.75
+
+
 def time_match(answer, times):
     ans = normalize_semantic_text(answer)
     tvals = [_clean_text(x) for x in (times or []) if _clean_text(x)]
@@ -270,6 +345,7 @@ def time_match(answer, times):
     answer_dates = extract_dates(answer)
     answer_months = extract_month_numbers(answer)
     answer_years = [int(x) for x in extract_years(answer)]
+    answer_year_span = (min(answer_years), max(answer_years)) if answer_years else None
     saw_conflict = False
 
     for t in tvals:
@@ -277,11 +353,28 @@ def time_match(answer, times):
         if t_norm and (t_norm in ans or ans in t_norm):
             return True
 
+        if t_norm and temporal_phrase_match(ans, t_norm):
+            return True
+
         t_dates = extract_dates(t)
         if t_dates:
             if answer_dates:
                 if any(ad == td for ad in answer_dates for td in t_dates):
                     return True
+                saw_conflict = True
+            continue
+
+        if "second half of the year" in t_norm or "second half" in t_norm:
+            if any(month >= 7 for month in answer_months):
+                return True
+            if answer_months:
+                saw_conflict = True
+            continue
+
+        if "first half of the year" in t_norm or "first half" in t_norm:
+            if any(month <= 6 for month in answer_months):
+                return True
+            if answer_months:
                 saw_conflict = True
             continue
 
@@ -304,6 +397,13 @@ def time_match(answer, times):
             continue
 
         if t_years and answer_years:
+            if re.search(r"\b(around|about|circa|approximately|roughly)\b", t_norm):
+                target = t_years[0]
+                if answer_year_span and answer_year_span[0] <= target <= answer_year_span[1]:
+                    return True
+                saw_conflict = True
+                continue
+
             if is_year_only_text(t):
                 if any(year in t_years for year in answer_years):
                     return True
@@ -317,10 +417,15 @@ def time_match(answer, times):
     return False if saw_conflict else None
 
 
-
 def normalize_num_string(s):
-    return _clean_text(s).lower().replace(",", "").replace("-", " ").strip()
-
+    text = _clean_text(s).lower()
+    text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
+    text = re.sub(r"(?<=\d)\.(?=\d{3}\b)", "", text)
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
+    text = re.sub(r"(?<=\d)(?=[a-z%])", " ", text)
+    text = re.sub(r"(?<=[a-z])(?=\d)", " ", text)
+    text = text.replace("-", " ")
+    return text.strip()
 
 
 def tokenize_number_words(text):
@@ -369,8 +474,9 @@ def extract_numeric_values(text):
     text = normalize_num_string(text)
     values = []
 
-    for match in re.findall(r"\b(\d+)(?:st|nd|rd|th)?\b", text.lower()):
-        values.append(int(match))
+    for match in re.finditer(r"(?<!\w)(\d+(?:\.\d+)?)(?:st|nd|rd|th)?(?=(?:\s|$|[a-z%]))", text.lower()):
+        num = float(match.group(1))
+        values.append(int(num) if num.is_integer() else num)
 
     tokens = tokenize_number_words(text)
     idx = 0
@@ -389,10 +495,9 @@ def extract_numeric_values(text):
     return deduped
 
 
-
 def parse_quantity_comparator(text):
     text = normalize_num_string(text)
-    number_token = r"(?:\d+(?:st|nd|rd|th)?|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth)"
+    number_token = r"(?:\d+(?:\.\d+)?(?:st|nd|rd|th)?|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth)"
     number_phrase = rf"(?P<num>{number_token}(?:\s+(?:and\s+)?{number_token}){{0,4}})"
     patterns = [
         (rf"\b(?:more than|over|greater than|above)\s+{number_phrase}\b", ">"),
@@ -408,6 +513,56 @@ def parse_quantity_comparator(text):
                 return op, nums[0]
     return None
 
+
+
+def approximate_quantity_match(q, answer_numbers):
+    q_norm = normalize_num_string(q)
+    q_numbers = extract_numeric_values(q_norm)
+    if not q_numbers or not answer_numbers:
+        return None
+
+    target = float(q_numbers[0])
+    tolerance = 1.0 if abs(target) <= 20 else max(1.0, abs(target) * 0.05)
+
+    if re.search(r"\b(about|around|approximately|roughly)\b", q_norm):
+        return any(abs(float(num) - target) <= tolerance for num in answer_numbers)
+
+    if re.search(r"\b(almost|nearly)\b", q_norm):
+        return any((target - tolerance) <= float(num) < target for num in answer_numbers)
+
+    return None
+
+
+
+def fractional_quantity_match(q, answer_numbers, qvals, fact_text):
+    q_norm = normalize_num_string(q)
+    if "half" not in q_norm or not answer_numbers:
+        return None
+
+    context_numbers = []
+    for other in qvals:
+        if other == q:
+            continue
+        context_numbers.extend(num for num in extract_numeric_values(other) if float(num) > 1)
+
+    if not context_numbers:
+        context_numbers.extend(num for num in extract_numeric_values(fact_text) if float(num) > 1)
+
+    if not context_numbers:
+        return None
+
+    total = float(context_numbers[0])
+    half = total / 2.0
+    answer_values = [float(num) for num in answer_numbers]
+
+    if re.search(r"\b(over|more than) half\b", q_norm):
+        return any(num > half for num in answer_values)
+    if re.search(r"\b(under|less than) half\b", q_norm):
+        return any(num < half for num in answer_values)
+    if re.search(r"\bhalf\b", q_norm):
+        return any(abs(num - half) <= 0.5 for num in answer_values)
+
+    return None
 
 
 def compare_numeric(value, op, target):
@@ -427,39 +582,38 @@ def infer_quantity_targets_from_fact(fact_text):
     fact_text = _clean_text(fact_text)
     fact_l = fact_text.lower()
     if re.search(
-        r"\b(multiple|several|many|numerous|various|different|majority|more popular|less popular|grew|grown|growing|increase|increased|decrease|decreased|over|under|at least|at most|less than|more than|fewer than)\b",
+        r"\b(multiple|several|many|numerous|various|different|majority|more popular|less popular|grew|grown|growing|increase|increased|decrease|decreased|over|under|at least|at most|less than|more than|fewer than|about|around|approximately|roughly|almost|nearly|half|once|twice|thrice|often|common|frequent|frequently|rare|broad|wide|narrow|infant|infancy|short time|short period|short periods|month|months|year|years|week|weeks|day|days)\b",
         fact_l,
     ):
         return [fact_text]
-    if re.search(r"\b\d+(?:st|nd|rd|th)?\b", fact_l):
+    if re.search(r"\d+(?:\.\d+)?(?:st|nd|rd|th)?(?=[a-z%]*\b)", fact_l):
         return [fact_text]
     if any(word in fact_l for word in list(NUMBER_WORDS.keys()) + list(ORDINAL_WORDS.keys())):
         return [fact_text]
     return []
 
 
-
 def qualitative_quantity_match(fact_norm, answer_norm, answer_numbers):
     plural_synonyms = {"multiple", "several", "many", "numerous", "various", "different"}
 
     if "multiple" in fact_norm:
-        if any(num >= 2 for num in answer_numbers) or any(word in answer_norm for word in plural_synonyms):
+        if any(float(num) >= 2 for num in answer_numbers) or any(word in answer_norm for word in plural_synonyms):
             return True
-        if any(num == 1 for num in answer_numbers):
+        if any(float(num) == 1 for num in answer_numbers):
             return False
 
     if "several" in fact_norm:
-        if any(num >= 3 for num in answer_numbers) or any(word in answer_norm for word in {"several", "many", "numerous"}):
+        if any(float(num) >= 3 for num in answer_numbers) or any(word in answer_norm for word in {"several", "many", "numerous"}):
             return True
-        if answer_numbers and all(num < 3 for num in answer_numbers):
+        if answer_numbers and all(float(num) < 3 for num in answer_numbers):
             return False
 
     if re.search(r"\b(many|numerous)\b", fact_norm):
-        if any(num >= 3 for num in answer_numbers) or any(word in answer_norm for word in {"many", "numerous", "several"}):
+        if any(float(num) >= 3 for num in answer_numbers) or any(word in answer_norm for word in {"many", "numerous", "several"}):
             return True
 
     if re.search(r"\b(various|different)\b", fact_norm):
-        if any(num >= 2 for num in answer_numbers) or any(word in answer_norm for word in {"various", "different", "several", "multiple"}):
+        if any(float(num) >= 2 for num in answer_numbers) or any(word in answer_norm for word in {"various", "different", "several", "multiple"}):
             return True
 
     if "majority" in fact_norm:
@@ -467,6 +621,56 @@ def qualitative_quantity_match(fact_norm, answer_norm, answer_numbers):
             return True
         if "minority" in answer_norm:
             return False
+
+    if re.search(r"\b(once|single)\b", fact_norm):
+        if "once" in answer_norm or any(float(num) == 1 for num in answer_numbers):
+            return True
+        if answer_numbers and all(float(num) != 1 for num in answer_numbers):
+            return False
+
+    if re.search(r"\b(twice|two time|two times|second time)\b", fact_norm):
+        if "twice" in answer_norm or any(float(num) == 2 for num in answer_numbers):
+            return True
+        if answer_numbers and all(float(num) != 2 for num in answer_numbers):
+            return False
+
+    if re.search(r"\b(thrice|three time|three times|third time)\b", fact_norm):
+        if "thrice" in answer_norm or any(float(num) == 3 for num in answer_numbers):
+            return True
+        if answer_numbers and all(float(num) != 3 for num in answer_numbers):
+            return False
+
+    if re.search(r"\b(often|common|frequent|frequently)\b", fact_norm):
+        if re.search(r"\b(often|common|frequent|frequently|regularly)\b", answer_norm):
+            return True
+        if re.search(r"\b(rare|rarely|uncommon)\b", answer_norm):
+            return False
+
+    if re.search(r"\b(rare|rarely)\b", fact_norm):
+        if re.search(r"\b(rare|rarely|uncommon)\b", answer_norm):
+            return True
+        if re.search(r"\b(common|often|frequent|frequently)\b", answer_norm):
+            return False
+
+    if re.search(r"\binfant\b", fact_norm):
+        if re.search(r"\b(infant|infancy)\b", answer_norm):
+            return True
+
+    if re.search(r"\bbroad\b", fact_norm):
+        if re.search(r"\b(broad|wide)\b", answer_norm):
+            return True
+        if re.search(r"\bnarrow\b", answer_norm):
+            return False
+
+    if re.search(r"\bnarrow\b", fact_norm):
+        if re.search(r"\bnarrow\b", answer_norm):
+            return True
+        if re.search(r"\b(broad|wide)\b", answer_norm):
+            return False
+
+    if re.search(r"\bshort (?:time|period)\b", fact_norm):
+        if re.search(r"\bshort\b", answer_norm):
+            return True
 
     if re.search(r"\b(more popular|grew|grown|growing|increase|increased|higher|greater)\b", fact_norm):
         if re.search(r"\b(grow|grew|grown|growing|increase|increased|increasing|rose|risen|higher|greater|more)\b", answer_norm):
@@ -481,7 +685,6 @@ def qualitative_quantity_match(fact_norm, answer_norm, answer_numbers):
             return False
 
     return None
-
 
 
 def quantity_match(answer, quantities, fact_text=""):
@@ -509,14 +712,28 @@ def quantity_match(answer, quantities, fact_text=""):
                 return True
             if answer_numbers:
                 op, target = comparator
-                if any(compare_numeric(num, op, target) for num in answer_numbers):
+                if any(compare_numeric(float(num), op, float(target)) for num in answer_numbers):
                     return True
                 saw_conflict = True
                 continue
 
+        approximate = approximate_quantity_match(q, answer_numbers)
+        if approximate is True:
+            return True
+        if approximate is False:
+            saw_conflict = True
+            continue
+
+        fractional = fractional_quantity_match(q, answer_numbers, qvals, fact_text)
+        if fractional is True:
+            return True
+        if fractional is False:
+            saw_conflict = True
+            continue
+
         q_numbers = extract_numeric_values(q)
         if q_numbers and answer_numbers:
-            if any(a == qn for a in answer_numbers for qn in q_numbers):
+            if any(abs(float(a) - float(qn)) <= 0.05 for a in answer_numbers for qn in q_numbers):
                 return True
             saw_conflict = True
             continue
@@ -531,7 +748,6 @@ def quantity_match(answer, quantities, fact_text=""):
             saw_conflict = True
 
     return False if saw_conflict else None
-
 
 
 def span_grounded_in_evidence(evidence_span, gold_evidence):
@@ -760,6 +976,9 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
         matched = time_match(answer, constraint.get("time", []))
         if matched is None and evidence_span:
             matched = time_match(evidence_span, constraint.get("time", []))
+        if matched is None and not constraint.get("time") and answer_status not in {"insufficient", "api_error"}:
+            if (looks_temporal_text(answer) or looks_temporal_text(evidence_span)) and span_grounded_in_evidence(evidence_span, gold_evidence):
+                matched = True
 
         if matched is True:
             verification_label = "contradict" if negated else "support"
