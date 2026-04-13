@@ -407,6 +407,7 @@ def main(args):
 
     with open(in_path, "r", encoding="utf-8") as f:
         raws = json.load(f)
+    raws = raws[args.start:args.end]
 
     results = []
     partial_func = partial(process_data_item)

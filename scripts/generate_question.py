@@ -388,13 +388,14 @@ def main(args):
 
     with open(in_path, "r", encoding="utf-8") as f:
         raws = json.load(f)
+    raws = raws[args.start:args.end]
 
     partial_func = partial(process_data_item, plan=args.plan, port=args.port)
     results = []
 
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = [executor.submit(partial_func, data) for data in raws]
-        for future in as_completed(futures):
+        for future in tqdm(as_completed(futures), total=len(futures)):
             try:
                 results.append(future.result())
             except Exception as e:

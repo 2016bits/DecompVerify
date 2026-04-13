@@ -39,10 +39,10 @@ def build_client_and_model(plan, port='8370'):
         return client, model, system_prompt, extra_body, max_tokens, temperature
 
     # 4) Azure OpenAI GPT-4o
-    elif plan in {"azure", "azure_gpt4o"}:
-        api_key = os.getenv("AZURE_API_KEY")
+    elif plan.startswith("azure"):
+        api_key = os.getenv("AZURE_OPENAI_API_KEY")
         if not api_key:
-            raise ValueError("AZURE_API_KEY is not set in environment variables.")
+            raise ValueError("AZURE_OPENAI_API_KEY is not set in environment variables.")
 
         azure_endpoint = "https://open1027.openai.azure.com/openai/v1/"
         model = "gpt-4o"
@@ -370,6 +370,7 @@ def main(args):
 
     with open(in_path, "r", encoding="utf-8") as f:
         raws = json.load(f)
+    raws = raws[args.start:args.end]
 
     partial_func = partial(process_data_item, plan=args.plan, port=args.port)
     results = []
