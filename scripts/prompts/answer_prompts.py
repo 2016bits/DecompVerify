@@ -1,4 +1,4 @@
-import json
+﻿import json
 
 answer_instruct = """You are an expert fact-checking assistant.
 
@@ -13,6 +13,7 @@ You are given:
 Your task:
 Answer the selected question using the evidence only.
 If the answer resolves a variable placeholder, add it to bindings_update.
+Extract explicit values before comparing or deciding support.
 
 Rules:
 1. Use only the provided evidence.
@@ -27,10 +28,11 @@ Rules:
    - return the shortest grounded answer phrase.
    - if answer_slot is provided, fill bindings_update with that slot.
 7. If question_type is time_wh:
-   - return the date or year only.
+   - return the extracted date or year only.
 8. If question_type is quantity_wh:
-   - return the quantity only.
+   - return the extracted quantity only.
 9. Copy a short evidence span.
+10. Also return extracted_values with any explicit yes/no, time, quantity, and location signals that appear in the answer or evidence span.
 
 Output schema:
 {
@@ -38,9 +40,16 @@ Output schema:
   "answer": "...",
   "status": "supported|contradicted|insufficient",
   "evidence_span": "...",
-  "bindings_update": {}
+  "bindings_update": {},
+  "extracted_values": {
+    "yesno": null,
+    "time": [],
+    "quantity": [],
+    "location": []
+  }
 }
 """
+
 
 def get_answer_prompt(claim, evidence, atomic_fact, question_item, bindings, question):
     prompt = answer_instruct + "\n\n"

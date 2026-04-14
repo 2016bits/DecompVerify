@@ -1,4 +1,4 @@
-import json
+﻿import json
 
 question_instruct = """You are an expert question-planning assistant for multi-hop fact verification.
 
@@ -12,7 +12,11 @@ Rules:
    - time_wh
    - quantity_wh
 3. For entity_wh questions, provide answer_slot when the question is expected to resolve a variable-like entity.
-4. Return JSON only.
+4. If constraint.negation is true, ask a positive yes/no probe about the underlying non-negated proposition.
+   - Keep the original time, quantity, location, and title / role constraints in the question.
+   - Set question_polarity to "positive_probe_for_negation".
+5. Otherwise set question_polarity to "literal_fact".
+6. Return JSON only.
 
 Output schema:
 {
@@ -21,6 +25,7 @@ Output schema:
       "fact_id": "f1",
       "main_question": "...",
       "question_type": "entity_wh",
+      "question_polarity": "literal_fact|positive_probe_for_negation",
       "answer_slot": "?team",
       "constraint_questions": [],
       "search_hints": ["..."]
@@ -28,6 +33,7 @@ Output schema:
   ]
 }
 """
+
 
 def get_question_prompt(claim, decomposition):
     prompt = question_instruct + "\n\n"
