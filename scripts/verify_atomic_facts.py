@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import argparse
 import importlib.util
@@ -139,26 +140,78 @@ def evaluate_constraint_checks(constraint, answer, evidence_span, extracted_valu
 
 
 
-def verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gold_evidence, extracted_values, constraint_eval):
-    grounded = verify_helpers.span_grounded_in_evidence(evidence_span, gold_evidence)
-    yesno = (extracted_values or {}).get("yesno") or verify_helpers.normalize_yesno(answer)
-    negated = verify_helpers.contains_negation(fact)
+def infer_relation_yesno_mode(fact, qitem, question_text):
+    negated_fact = verify_helpers.contains_negation(fact)
     question_polarity = _clean_text((qitem or {}).get("question_polarity", "literal_fact")) or "literal_fact"
+    question_has_negation = bool(
+        re.search(r"\b(?:no|not|never|none|without)\b", _clean_text(question_text).lower())
+    )
 
-    if negated or question_polarity == "positive_probe_for_negation":
-        if yesno == "yes" and grounded:
-            return "contradict", "The positive yes/no probe is answered yes, so the negated fact is refuted.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": True}
-        if yesno == "no" and grounded and constraint_eval.get("all_required_satisfied", False):
-            return "support", "The positive yes/no probe is answered no and the required constraints are grounded.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": False}
-        return "insufficient", "The negated fact cannot be resolved with grounded no-answer plus satisfied constraints.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": constraint_eval.get("explicit_conflict", False)}
+    # Some questions are tagged as positive probes even though the surface form
+    # still contains a negation cue like "no", "never", or "none".
+    if question_polarity == "positive_probe_for_negation" and not question_has_negation:
+        return "positive_probe_for_negation"
+    if negated_fact:
+        return "literal_negated_fact"
+    return "literal_fact"
 
-    if answer_status in {"insufficient", "api_error"} or yesno is None:
-        return "insufficient", "The answer does not clearly determine the fact.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": False}
+
+def resolve_relation_yesno_label(mode, yesno, grounded, constraint_eval):
     if not grounded:
         return "insufficient", "The yes/no answer is not grounded enough in the provided evidence.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": False}
+
+    if mode == "positive_probe_for_negation":
+        if yesno == "yes":
+            return "contradict", "The positive yes/no probe is answered yes, so the negated fact is refuted.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": True}
+        if yesno == "no" and constraint_eval.get("all_required_satisfied", False):
+            return "support", "The positive yes/no probe is answered no and the required constraints are grounded.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": False}
+        return "insufficient", "The negated fact cannot be resolved with a grounded no-answer unless the required constraints are satisfied.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": constraint_eval.get("explicit_conflict", False)}
+
+    if mode == "literal_negated_fact":
+        if yesno == "yes" and constraint_eval.get("all_required_satisfied", False):
+            return "support", "The answer directly affirms the negated fact and the required constraints are grounded.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": False}
+        if yesno == "no":
+            return "contradict", "The answer denies the negated fact.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": True}
+        return "insufficient", "The negated fact cannot be confirmed because the required constraints are not fully satisfied.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": constraint_eval.get("explicit_conflict", False)}
+
     if yesno == "yes":
         return "support", "The answer affirms the fact.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": False}
     return "contradict", "The answer denies the fact.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": True}
+
+
+def recover_entity_wh_from_constraints(answer_status, evidence_span, gold_evidence, constraint_eval):
+    if answer_status not in {"insufficient", "api_error"}:
+        return None
+    if not verify_helpers.span_grounded_in_evidence(evidence_span, gold_evidence):
+        return None
+    if constraint_eval.get("explicit_conflict", False):
+        return None
+
+    matched_keys = [
+        key for key in ("time", "quantity")
+        if (constraint_eval.get("checks", {}).get(key, {}) or {}).get("match") is True
+    ]
+    if not matched_keys:
+        return None
+
+    joined = ", ".join(matched_keys)
+    return (
+        "support",
+        f"The direct entity answer was missing, but the grounded evidence span satisfies the {joined} constraint(s).",
+        {"explicit_conflict": False},
+    )
+
+
+def verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gold_evidence, extracted_values, constraint_eval):
+    grounded = verify_helpers.span_grounded_in_evidence(evidence_span, gold_evidence)
+    yesno = (extracted_values or {}).get("yesno") or verify_helpers.normalize_yesno(answer)
+
+    if answer_status in {"insufficient", "api_error"} or yesno is None:
+        return "insufficient", "The answer does not clearly determine the fact.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": False}
+
+    question_text = _clean_text((qitem or {}).get("main_question", ""))
+    mode = infer_relation_yesno_mode(fact, qitem, question_text)
+    return resolve_relation_yesno_label(mode, yesno, grounded, constraint_eval)
 
 
 
@@ -216,10 +269,8 @@ def run_second_pass_adjudication(fact, qitem, answer_status, initial_label, evid
         final_label = "insufficient"
         reason = "Second pass downgrades to insufficient because the supported answer is not grounded in the provided evidence span."
     elif question_type == "relation_yesno" and yesno in {"yes", "no"}:
-        if verify_helpers.contains_negation(fact):
-            final_label = "support" if yesno == "no" and constraint_eval.get("all_required_satisfied", False) else "contradict" if yesno == "yes" else "insufficient"
-        else:
-            final_label = "support" if yesno == "yes" else "contradict"
+        mode = infer_relation_yesno_mode(fact, qitem, _clean_text((qitem or {}).get("main_question", "")))
+        final_label, _, _ = resolve_relation_yesno_label(mode, yesno, grounded, constraint_eval)
         reason = "Second pass resolves the answer/verifier conflict using the grounded yes/no answer and the constraint checks."
     elif question_type == "time_wh" and constraint_eval["checks"]["time"].get("match") is True:
         final_label = "support"
@@ -318,6 +369,9 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
             gold_evidence=gold_evidence,
         )
         verifier_metadata = {"explicit_conflict": verification_label == "contradict"}
+        recovered = recover_entity_wh_from_constraints(answer_status, evidence_span, gold_evidence, constraint_eval)
+        if verification_label == "insufficient" and recovered is not None:
+            verification_label, reason, verifier_metadata = recovered
     else:
         verification_label, reason, verifier_metadata = verify_fallback(fact, answer, answer_status, evidence_span, gold_evidence)
 
