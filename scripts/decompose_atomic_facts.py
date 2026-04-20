@@ -105,6 +105,12 @@ MONTH_WORDS = {
 NON_ENTITY_CAPITALIZED = {
     "The", "A", "An", "In", "On", "At", "By", "From", "To", "And", "Or",
     "He", "She", "It", "They", "This", "That", "These", "Those",
+    "Both", "Yes", "No", "Former", "Latter",
+}
+
+QUANTITY_TRAILING_STOPWORDS = {
+    "in", "on", "at", "of", "for", "to", "from", "by", "with",
+    "is", "are", "was", "were", "be", "been", "being",
 }
 
 
@@ -359,6 +365,12 @@ def extract_quantity_targets(text):
             value = _clean_text(match.group(0))
             if not value:
                 continue
+            parts = value.split()
+            while len(parts) > 1 and parts[-1].lower() in QUANTITY_TRAILING_STOPWORDS:
+                parts.pop()
+            value = _clean_text(" ".join(parts)).strip(" ,;:.")
+            if not value:
+                continue
             if re.fullmatch(r"\d{3,4}", value):
                 continue
             if value not in targets:
@@ -419,14 +431,19 @@ def extract_role_title_targets(text):
 def extract_exact_name_targets(text):
     targets = []
     for match in PROPER_NOUN_PATTERN.finditer(text):
-        value = _clean_text(match.group(0))
-        if not value or value in NON_ENTITY_CAPITALIZED:
+        raw_value = _clean_text(match.group(0))
+        if not raw_value:
             continue
-        lower = value.lower()
-        if lower in MONTH_WORDS:
-            continue
-        if value not in targets:
-            targets.append(value)
+        parts = re.split(r"(?<=[.!?])\s+", raw_value)
+        for part in parts:
+            value = _clean_text(part).strip(" ,;:.")
+            if not value or value in NON_ENTITY_CAPITALIZED:
+                continue
+            lower = value.lower()
+            if lower in MONTH_WORDS:
+                continue
+            if value not in targets:
+                targets.append(value)
     return targets
 
 
@@ -538,7 +555,9 @@ def find_unresolved_coref_mentions(facts):
         matches = []
         for match in COREf_PRONOUN_PATTERN.finditer(stripped):
             token = match.group(1)
-            if token.lower() in {"it"} and re.search(r"\bIs it true that\b", stripped, flags=re.IGNORECASE):
+            if token.lower() in {"it"} and re.search(r"Is it true that", stripped, flags=re.IGNORECASE):
+                continue
+            if token.lower() == "that" and token != "That":
                 continue
             matches.append(token)
         if matches:

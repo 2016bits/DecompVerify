@@ -228,13 +228,20 @@ def build_yesno_question(statement):
 
 
 
-def choose_fallback_question(fact):
+def is_fallback_claim_fact(fact):
+    return "fallback_claim_fact" in (fact.get("critical_reasons", []) or [])
+
+
+
+def choose_fallback_question(fact, force_relation_yesno=False):
     fact_text = _clean_text(fact.get("text", ""))
     constraint = fact.get("constraint", {}) or {}
     positive_text = strip_fact_negation(fact_text) if constraint.get("negation") is True else fact_text
 
     if constraint.get("negation") is True:
         return "relation_yesno", build_yesno_question(positive_text), "positive_probe_for_negation"
+    if force_relation_yesno:
+        return "relation_yesno", build_yesno_question(fact_text), "literal_fact"
     if constraint.get("time"):
         return "time_wh", f"When did {positive_text}?", "literal_fact"
     if constraint.get("quantity"):
@@ -256,10 +263,12 @@ def normalize_question_item(item, atomic_fact):
     main_question = _clean_text(item.get("main_question", "") or item.get("question", ""))
     question_polarity = _clean_text(item.get("question_polarity", ""))
 
-    if not qtype or not main_question:
+    constraint = atomic_fact.get("constraint", {}) or {}
+    if is_fallback_claim_fact(atomic_fact):
+        qtype, main_question, question_polarity = choose_fallback_question(atomic_fact, force_relation_yesno=True)
+    elif not qtype or not main_question:
         qtype, main_question, question_polarity = choose_fallback_question(atomic_fact)
 
-    constraint = atomic_fact.get("constraint", {}) or {}
     if constraint.get("negation") is True:
         positive_text = strip_fact_negation(atomic_fact.get("text", ""))
         if qtype != "relation_yesno":
@@ -286,7 +295,9 @@ def normalize_question_item(item, atomic_fact):
         constraint_questions = []
 
     answer_slot = _clean_text(item.get("answer_slot", ""))
-    if not answer_slot:
+    if is_fallback_claim_fact(atomic_fact):
+        answer_slot = None
+    elif not answer_slot:
         answer_slot = infer_answer_slot(qtype, atomic_fact.get("text", ""), main_question)
 
     return {
