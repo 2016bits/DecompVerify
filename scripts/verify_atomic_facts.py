@@ -7,6 +7,7 @@ from pathlib import Path
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from difflib import SequenceMatcher
 
 from tqdm import tqdm
 
@@ -76,6 +77,81 @@ def collect_observed_texts(answer, evidence_span, extracted_values, key):
     return texts
 
 
+def _constraint_tokens(text):
+    return [
+        tok for tok in verify_helpers.normalize_text_for_match(text).split()
+        if tok and tok not in verify_helpers.STOPWORD_TOKENS
+    ]
+
+
+def _common_prefix_len(a, b):
+    limit = min(len(a), len(b))
+    matched = 0
+    while matched < limit and a[matched] == b[matched]:
+        matched += 1
+    return matched
+
+
+def _soft_token_match(a, b):
+    if a == b:
+        return True
+
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) >= 5 and longer.startswith(shorter):
+        return True
+
+    if len(shorter) >= 6 and _common_prefix_len(a, b) >= 5:
+        return True
+
+    if len(shorter) >= 4 and abs(len(a) - len(b)) <= 1 and SequenceMatcher(None, a, b).ratio() >= 0.85:
+        return True
+
+    if len(shorter) >= 7 and SequenceMatcher(None, a, b).ratio() >= 0.9:
+        return True
+
+    return False
+
+
+def soft_phrase_match(candidate, target):
+    candidate_tokens = _constraint_tokens(candidate)
+    target_tokens = _constraint_tokens(target)
+    if not candidate_tokens or not target_tokens:
+        return False
+
+    matched = 0
+    for target_token in target_tokens:
+        if any(_soft_token_match(target_token, candidate_token) for candidate_token in candidate_tokens):
+            matched += 1
+
+    return matched / max(1, len(target_tokens)) >= 0.75
+
+
+def build_textual_constraint_check(answer, evidence_span, targets, require_all=True):
+    observed_texts = [_clean_text(answer), _clean_text(evidence_span)]
+    normalized_targets = _clean_list(targets)
+    if not normalized_targets:
+        return {"targets": [], "observed": observed_texts, "match": None, "matched_targets": [], "unmatched_targets": []}
+
+    matched_targets = []
+    unmatched_targets = []
+    for target in normalized_targets:
+        matched = any(soft_phrase_match(observed, target) for observed in observed_texts if observed)
+        if matched:
+            matched_targets.append(target)
+        else:
+            unmatched_targets.append(target)
+
+    match = len(unmatched_targets) == 0 if require_all else len(matched_targets) > 0
+    return {
+        "targets": normalized_targets,
+        "observed": observed_texts,
+        "match": match,
+        "match_all": len(unmatched_targets) == 0,
+        "matched_targets": matched_targets,
+        "unmatched_targets": unmatched_targets,
+    }
+
+
 
 def build_time_check(answer, evidence_span, extracted_values, targets):
     observed_texts = collect_observed_texts(answer, evidence_span, extracted_values, "time")
@@ -127,15 +203,27 @@ def evaluate_constraint_checks(constraint, answer, evidence_span, extracted_valu
         "time": build_time_check(answer, evidence_span, extracted_values, (constraint or {}).get("time", [])),
         "quantity": build_quantity_check(answer, evidence_span, extracted_values, (constraint or {}).get("quantity", []), fact_text),
         "location": build_location_check(answer, evidence_span, extracted_values, (constraint or {}).get("location", [])),
+        "comparison": build_textual_constraint_check(answer, evidence_span, (constraint or {}).get("comparison", [])),
+        "unique_modifier": build_textual_constraint_check(answer, evidence_span, (constraint or {}).get("unique_modifier", [])),
+        "title_role": build_textual_constraint_check(answer, evidence_span, (constraint or {}).get("title_role", [])),
+        "exact_name": build_textual_constraint_check(answer, evidence_span, (constraint or {}).get("exact_name", []), require_all=False),
     }
-    required_keys = [key for key, payload in checks.items() if payload.get("targets")]
+    required_keys = [key for key in ("time", "quantity", "location") if checks[key].get("targets")]
     all_required_satisfied = all(checks[key].get("match") is True for key in required_keys) if required_keys else True
-    explicit_conflict = any(checks[key].get("match") is False for key in checks)
+    explicit_conflict = any(checks[key].get("match") is False for key in ("time", "quantity", "location"))
+    textual_required_keys = [key for key in ("comparison", "unique_modifier", "title_role") if checks[key].get("targets")]
+    all_textual_satisfied = all(checks[key].get("match") is True for key in textual_required_keys) if textual_required_keys else True
+    any_textual_missed = any(checks[key].get("match") is False for key in textual_required_keys)
     return {
         "checks": checks,
         "required_keys": required_keys,
         "all_required_satisfied": all_required_satisfied,
         "explicit_conflict": explicit_conflict,
+        "textual_required_keys": textual_required_keys,
+        "all_textual_satisfied": all_textual_satisfied,
+        "any_textual_missed": any_textual_missed,
+        "exact_name_match": checks["exact_name"].get("match"),
+        "exact_name_all_match": checks["exact_name"].get("match_all"),
     }
 
 
@@ -179,6 +267,84 @@ def resolve_relation_yesno_label(mode, yesno, grounded, constraint_eval):
     return "contradict", "The answer denies the fact.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": True}
 
 
+def adjust_relation_yesno_by_textual_constraints(label, answer_status, mode, grounded, constraint_eval, metadata):
+    has_textual_targets = bool(constraint_eval.get("textual_required_keys"))
+    all_textual_satisfied = constraint_eval.get("all_textual_satisfied", True)
+    textual_keys = set(constraint_eval.get("textual_required_keys", []))
+    all_required_satisfied = constraint_eval.get("all_required_satisfied", False)
+    explicit_conflict = constraint_eval.get("explicit_conflict", False)
+    allow_textual_upgrade = not ("unique_modifier" in textual_keys and "title_role" not in textual_keys)
+    exact_name_check = (constraint_eval.get("checks", {}) or {}).get("exact_name", {}) or {}
+    matched_exact_names = exact_name_check.get("matched_targets", []) or []
+    unmatched_exact_names = exact_name_check.get("unmatched_targets", []) or []
+    near_exact_name_match = bool(matched_exact_names) and len(unmatched_exact_names) <= 1
+
+    if (
+        label == "contradict"
+        and answer_status == "contradicted"
+        and mode == "literal_fact"
+        and grounded
+        and has_textual_targets
+        and all_textual_satisfied
+        and allow_textual_upgrade
+        and not explicit_conflict
+    ):
+        return (
+            "support",
+            "Although the answer denied the relation, the grounded evidence span matches the fact's key textual modifiers.",
+            {
+                "yesno": metadata.get("yesno"),
+                "grounded": grounded,
+                "explicit_conflict": False,
+            },
+        )
+
+    if (
+        label == "contradict"
+        and answer_status == "contradicted"
+        and mode == "literal_fact"
+        and grounded
+        and not has_textual_targets
+        and near_exact_name_match
+        and all_required_satisfied
+        and not explicit_conflict
+    ):
+        return (
+            "support",
+            "Although the answer denied the relation, the grounded evidence span matches the fact's exact-name target closely enough to recover the relation.",
+            {
+                "yesno": metadata.get("yesno"),
+                "grounded": grounded,
+                "explicit_conflict": False,
+            },
+        )
+
+    return label, None, metadata
+
+
+def adjust_entity_by_textual_constraints(label, answer, answer_status, grounded, constraint_eval):
+    has_textual_targets = bool(constraint_eval.get("textual_required_keys"))
+    all_textual_satisfied = constraint_eval.get("all_textual_satisfied", True)
+    exact_name_match = constraint_eval.get("exact_name_match") is True
+
+    if (
+        label in {"contradict", "insufficient"}
+        and answer_status not in {"insufficient", "api_error"}
+        and _clean_text(answer).lower() != "insufficient"
+        and grounded
+        and exact_name_match
+        and (not has_textual_targets or all_textual_satisfied)
+        and not constraint_eval.get("explicit_conflict", False)
+    ):
+        return (
+            "support",
+            "The entity answer is grounded and matches the fact's exact-name target despite the initial verifier mismatch.",
+            {"explicit_conflict": False},
+        )
+
+    return label, None, {"explicit_conflict": label == "contradict"}
+
+
 def recover_entity_wh_from_constraints(answer_status, evidence_span, gold_evidence, constraint_eval):
     if answer_status not in {"insufficient", "api_error"}:
         return None
@@ -211,7 +377,16 @@ def verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gol
 
     question_text = _clean_text((qitem or {}).get("main_question", ""))
     mode = infer_relation_yesno_mode(fact, qitem, question_text)
-    return resolve_relation_yesno_label(mode, yesno, grounded, constraint_eval)
+    label, reason, metadata = resolve_relation_yesno_label(mode, yesno, grounded, constraint_eval)
+    adjusted_label, adjusted_reason, adjusted_metadata = adjust_relation_yesno_by_textual_constraints(
+        label=label,
+        answer_status=answer_status,
+        mode=mode,
+        grounded=grounded,
+        constraint_eval=constraint_eval,
+        metadata=metadata,
+    )
+    return adjusted_label, (adjusted_reason or reason), adjusted_metadata
 
 
 
@@ -369,6 +544,17 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
             gold_evidence=gold_evidence,
         )
         verifier_metadata = {"explicit_conflict": verification_label == "contradict"}
+        adjusted_label, adjusted_reason, adjusted_metadata = adjust_entity_by_textual_constraints(
+            label=verification_label,
+            answer=answer,
+            answer_status=answer_status,
+            grounded=verify_helpers.span_grounded_in_evidence(evidence_span, gold_evidence),
+            constraint_eval=constraint_eval,
+        )
+        verification_label = adjusted_label
+        if adjusted_reason:
+            reason = adjusted_reason
+        verifier_metadata = adjusted_metadata
         recovered = recover_entity_wh_from_constraints(answer_status, evidence_span, gold_evidence, constraint_eval)
         if verification_label == "insufficient" and recovered is not None:
             verification_label, reason, verifier_metadata = recovered
