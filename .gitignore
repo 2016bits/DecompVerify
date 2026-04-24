@@ -8,3 +8,4 @@ scripts/__pycache__/
 scripts/utils/__pycache__
 scripts/llm
 .codex
+scripts/run_scripts
