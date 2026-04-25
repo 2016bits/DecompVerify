@@ -267,17 +267,91 @@ def resolve_relation_yesno_label(mode, yesno, grounded, constraint_eval):
     return "contradict", "The answer denies the fact.", {"yesno": yesno, "grounded": grounded, "explicit_conflict": True}
 
 
+def span_has_effective_negation(text, fact_text=""):
+    text_l = _clean_text(text).lower()
+    if not text_l:
+        return False
+
+    text_l = re.sub(r"\bnot\s+(?:only|just|merely|solely)\b", " ", text_l)
+    fact_l = _clean_text(fact_text).lower()
+    if not re.search(r"\b(?:fail(?:ed|s|ing)?|unsuccessful(?:ly)?)\b", fact_l):
+        text_l = re.sub(r"\bunsuccessful(?:ly)?\b", " ", text_l)
+    if re.search(r"\b(?:isn't|aren't|wasn't|weren't|doesn't|don't|didn't|hasn't|haven't|hadn't|can't|cannot|couldn't|won't|wouldn't|shouldn't)\b", text_l):
+        return True
+    return verify_helpers.contains_explicit_negation(text_l)
+
+
+def has_strong_unique_modifier_match(constraint_eval):
+    unique_check = ((constraint_eval.get("checks", {}) or {}).get("unique_modifier", {}) or {})
+    if unique_check.get("match") is not True:
+        return False
+    targets = unique_check.get("targets", []) or []
+    if not targets:
+        return False
+    return all(len(_constraint_tokens(target)) >= 3 for target in targets)
+
+
+RELATION_COVERAGE_STOPWORDS = verify_helpers.STOPWORD_TOKENS | {
+    "and", "or", "that", "which", "who", "whose", "whom", "this", "that",
+    "these", "those", "there", "their", "his", "her", "its", "as", "it",
+    "is", "are", "was", "were", "be", "been", "being", "has", "have",
+    "had", "do", "does", "did", "true", "fact", "occurred", "occur",
+}
+
+
+def relation_content_tokens(text):
+    return [
+        tok for tok in verify_helpers.normalize_text_for_match(text).split()
+        if len(tok) > 2 and tok not in RELATION_COVERAGE_STOPWORDS
+    ]
+
+
+def fact_span_coverage_match(fact_text, evidence_span):
+    target_tokens = []
+    for token in relation_content_tokens(fact_text):
+        if token not in target_tokens:
+            target_tokens.append(token)
+    candidate_tokens = relation_content_tokens(evidence_span)
+
+    if len(target_tokens) < 4 or not candidate_tokens:
+        return False
+
+    matched = 0
+    for target_token in target_tokens:
+        if any(_soft_token_match(target_token, candidate_token) for candidate_token in candidate_tokens):
+            matched += 1
+
+    return matched / max(1, len(target_tokens)) >= 0.78
+
+
+def exact_names_recoverable_from_eval(constraint_eval):
+    exact_name_check = ((constraint_eval.get("checks", {}) or {}).get("exact_name", {}) or {})
+    exact_name_targets = exact_name_check.get("targets", []) or []
+    matched_exact_names = exact_name_check.get("matched_targets", []) or []
+    unmatched_exact_names = exact_name_check.get("unmatched_targets", []) or []
+    near_exact_name_match = bool(matched_exact_names) and len(unmatched_exact_names) <= 1
+    return not exact_name_targets or exact_name_check.get("match_all") is True or near_exact_name_match
+
+
 def adjust_relation_yesno_by_textual_constraints(label, answer_status, mode, grounded, constraint_eval, metadata):
     has_textual_targets = bool(constraint_eval.get("textual_required_keys"))
     all_textual_satisfied = constraint_eval.get("all_textual_satisfied", True)
     textual_keys = set(constraint_eval.get("textual_required_keys", []))
     all_required_satisfied = constraint_eval.get("all_required_satisfied", False)
     explicit_conflict = constraint_eval.get("explicit_conflict", False)
-    allow_textual_upgrade = not ("unique_modifier" in textual_keys and "title_role" not in textual_keys)
     exact_name_check = (constraint_eval.get("checks", {}) or {}).get("exact_name", {}) or {}
+    exact_names_recoverable = exact_names_recoverable_from_eval(constraint_eval)
     matched_exact_names = exact_name_check.get("matched_targets", []) or []
     unmatched_exact_names = exact_name_check.get("unmatched_targets", []) or []
     near_exact_name_match = bool(matched_exact_names) and len(unmatched_exact_names) <= 1
+    unique_without_role = "unique_modifier" in textual_keys and "title_role" not in textual_keys
+    strong_unique_match = has_strong_unique_modifier_match(constraint_eval)
+    allow_textual_upgrade = (
+        not unique_without_role
+        or "comparison" in textual_keys
+        or exact_name_check.get("match_all") is True
+        or strong_unique_match
+    )
 
     if (
         label == "contradict"
@@ -287,6 +361,7 @@ def adjust_relation_yesno_by_textual_constraints(label, answer_status, mode, gro
         and has_textual_targets
         and all_textual_satisfied
         and allow_textual_upgrade
+        and exact_names_recoverable
         and not explicit_conflict
     ):
         return (
@@ -378,6 +453,25 @@ def verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gol
     question_text = _clean_text((qitem or {}).get("main_question", ""))
     mode = infer_relation_yesno_mode(fact, qitem, question_text)
     label, reason, metadata = resolve_relation_yesno_label(mode, yesno, grounded, constraint_eval)
+
+    if (
+        mode == "positive_probe_for_negation"
+        and yesno == "no"
+        and label == "support"
+        and not span_has_effective_negation(evidence_span, fact.get("text", ""))
+    ):
+        if answer_status == "contradicted":
+            return (
+                "contradict",
+                "The positive probe was denied, but the grounded evidence span does not express the negation and instead conflicts with the negated fact.",
+                {"yesno": yesno, "grounded": grounded, "explicit_conflict": True},
+            )
+        return (
+            "insufficient",
+            "The positive probe was denied, but the evidence span does not explicitly ground the negated fact.",
+            {"yesno": yesno, "grounded": grounded, "explicit_conflict": False},
+        )
+
     adjusted_label, adjusted_reason, adjusted_metadata = adjust_relation_yesno_by_textual_constraints(
         label=label,
         answer_status=answer_status,
@@ -386,6 +480,25 @@ def verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gol
         constraint_eval=constraint_eval,
         metadata=metadata,
     )
+
+    if (
+        adjusted_label == "contradict"
+        and label == "contradict"
+        and answer_status == "contradicted"
+        and mode == "literal_fact"
+        and grounded
+        and not constraint_eval.get("textual_required_keys")
+        and constraint_eval.get("all_required_satisfied", False)
+        and not constraint_eval.get("explicit_conflict", False)
+        and exact_names_recoverable_from_eval(constraint_eval)
+        and fact_span_coverage_match(fact.get("text", ""), evidence_span)
+    ):
+        return (
+            "support",
+            "Although the answer denied the relation, the evidence span covers the fact's core content with no explicit value conflict.",
+            {"yesno": yesno, "grounded": grounded, "explicit_conflict": False},
+        )
+
     return adjusted_label, (adjusted_reason or reason), adjusted_metadata
 
 
@@ -528,9 +641,11 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
         }
 
     constraint_eval = evaluate_constraint_checks(constraint, answer, evidence_span, extracted_values, bound_fact_text)
+    bound_fact = dict(fact)
+    bound_fact["text"] = bound_fact_text
 
     if question_type == "relation_yesno":
-        verification_label, reason, verifier_metadata = verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gold_evidence, extracted_values, constraint_eval)
+        verification_label, reason, verifier_metadata = verify_relation_yesno(bound_fact, qitem, answer, answer_status, evidence_span, gold_evidence, extracted_values, constraint_eval)
     elif question_type == "time_wh":
         verification_label, reason, verifier_metadata = verify_time_wh(fact, answer_status, constraint_eval)
     elif question_type == "quantity_wh":
@@ -562,7 +677,7 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
         verification_label, reason, verifier_metadata = verify_fallback(fact, answer, answer_status, evidence_span, gold_evidence)
 
     adjudication = run_second_pass_adjudication(
-        fact=fact,
+        fact=bound_fact,
         qitem=qitem,
         answer_status=answer_status,
         initial_label=verification_label,
