@@ -155,15 +155,35 @@ def build_textual_constraint_check(answer, evidence_span, targets, require_all=T
 
 def build_time_check(answer, evidence_span, extracted_values, targets):
     observed_texts = collect_observed_texts(answer, evidence_span, extracted_values, "time")
+    normalized_targets = _clean_list(targets)
+    if len(normalized_targets) > 1:
+        per_target = []
+        for target in normalized_targets:
+            target_match = None
+            for text in observed_texts:
+                current = verify_helpers.time_match(text, [target])
+                if current is True:
+                    target_match = True
+                    break
+                if current is False:
+                    target_match = False if target_match is not True else True
+            per_target.append(target_match)
+
+        if all(value is True for value in per_target):
+            return {"targets": normalized_targets, "observed": observed_texts, "match": True, "per_target_match": per_target}
+        if any(value is False for value in per_target):
+            return {"targets": normalized_targets, "observed": observed_texts, "match": False, "per_target_match": per_target}
+        return {"targets": normalized_targets, "observed": observed_texts, "match": None, "per_target_match": per_target}
+
     match = None
     for text in observed_texts:
-        current = verify_helpers.time_match(text, targets)
+        current = verify_helpers.time_match(text, normalized_targets)
         if current is True:
             match = True
             break
         if current is False:
             match = False if match is not True else True
-    return {"targets": _clean_list(targets), "observed": observed_texts, "match": match}
+    return {"targets": normalized_targets, "observed": observed_texts, "match": match}
 
 
 
@@ -229,15 +249,17 @@ def evaluate_constraint_checks(constraint, answer, evidence_span, extracted_valu
 
 
 def infer_relation_yesno_mode(fact, qitem, question_text):
-    negated_fact = verify_helpers.contains_negation(fact)
+    fact_text = _clean_text((fact or {}).get("text", ""))
+    negated_fact = verify_helpers.contains_negation(fact) or span_has_effective_negation(fact_text, fact_text)
     question_polarity = _clean_text((qitem or {}).get("question_polarity", "literal_fact")) or "literal_fact"
-    question_has_negation = bool(
-        re.search(r"\b(?:no|not|never|none|without)\b", _clean_text(question_text).lower())
+    question_has_negation = (
+        verify_helpers.contains_explicit_negation(question_text)
+        or span_has_effective_negation(question_text, fact_text)
     )
 
-    # Some questions are tagged as positive probes even though the surface form
-    # still contains a negation cue like "no", "never", or "none".
-    if question_polarity == "positive_probe_for_negation" and not question_has_negation:
+    # Trust the positive-probe tag only when the fact itself is negated and
+    # the generated question asks the corresponding positive form.
+    if question_polarity == "positive_probe_for_negation" and negated_fact and not question_has_negation:
         return "positive_probe_for_negation"
     if negated_fact:
         return "literal_negated_fact"
@@ -307,6 +329,10 @@ def relation_content_tokens(text):
 
 
 def fact_span_coverage_match(fact_text, evidence_span):
+    return fact_span_coverage_ratio(fact_text, evidence_span) >= 0.78
+
+
+def fact_span_coverage_ratio(fact_text, evidence_span):
     target_tokens = []
     for token in relation_content_tokens(fact_text):
         if token not in target_tokens:
@@ -314,14 +340,14 @@ def fact_span_coverage_match(fact_text, evidence_span):
     candidate_tokens = relation_content_tokens(evidence_span)
 
     if len(target_tokens) < 4 or not candidate_tokens:
-        return False
+        return 0.0
 
     matched = 0
     for target_token in target_tokens:
         if any(_soft_token_match(target_token, candidate_token) for candidate_token in candidate_tokens):
             matched += 1
 
-    return matched / max(1, len(target_tokens)) >= 0.78
+    return matched / max(1, len(target_tokens))
 
 
 def exact_names_recoverable_from_eval(constraint_eval):
@@ -333,7 +359,22 @@ def exact_names_recoverable_from_eval(constraint_eval):
     return not exact_name_targets or exact_name_check.get("match_all") is True or near_exact_name_match
 
 
-def adjust_relation_yesno_by_textual_constraints(label, answer_status, mode, grounded, constraint_eval, metadata):
+def contradicted_answer_can_be_recovered(fact_text, evidence_span, constraint_eval):
+    exact_name_check = (constraint_eval.get("checks", {}) or {}).get("exact_name", {}) or {}
+    exact_name_targets = exact_name_check.get("targets", []) or []
+    has_structured_target = bool(
+        exact_name_targets
+        or constraint_eval.get("required_keys")
+        or constraint_eval.get("textual_required_keys")
+    )
+    if not has_structured_target:
+        return False
+    if exact_name_targets and exact_name_check.get("match_all") is not True:
+        return False
+    return fact_span_coverage_ratio(fact_text, evidence_span) >= 0.9
+
+
+def adjust_relation_yesno_by_textual_constraints(label, answer_status, mode, grounded, constraint_eval, metadata, fact_text="", evidence_span=""):
     has_textual_targets = bool(constraint_eval.get("textual_required_keys"))
     all_textual_satisfied = constraint_eval.get("all_textual_satisfied", True)
     textual_keys = set(constraint_eval.get("textual_required_keys", []))
@@ -352,6 +393,10 @@ def adjust_relation_yesno_by_textual_constraints(label, answer_status, mode, gro
         or exact_name_check.get("match_all") is True
         or strong_unique_match
     )
+    allow_contradicted_recovery = (
+        answer_status != "contradicted"
+        or contradicted_answer_can_be_recovered(fact_text, evidence_span, constraint_eval)
+    )
 
     if (
         label == "contradict"
@@ -361,6 +406,7 @@ def adjust_relation_yesno_by_textual_constraints(label, answer_status, mode, gro
         and has_textual_targets
         and all_textual_satisfied
         and allow_textual_upgrade
+        and allow_contradicted_recovery
         and exact_names_recoverable
         and not explicit_conflict
     ):
@@ -381,6 +427,7 @@ def adjust_relation_yesno_by_textual_constraints(label, answer_status, mode, gro
         and grounded
         and not has_textual_targets
         and near_exact_name_match
+        and allow_contradicted_recovery
         and all_required_satisfied
         and not explicit_conflict
     ):
@@ -401,6 +448,7 @@ def adjust_entity_by_textual_constraints(label, answer, answer_status, grounded,
     has_textual_targets = bool(constraint_eval.get("textual_required_keys"))
     all_textual_satisfied = constraint_eval.get("all_textual_satisfied", True)
     exact_name_match = constraint_eval.get("exact_name_match") is True
+    all_required_satisfied = constraint_eval.get("all_required_satisfied", True)
 
     if (
         label in {"contradict", "insufficient"}
@@ -414,6 +462,21 @@ def adjust_entity_by_textual_constraints(label, answer, answer_status, grounded,
         return (
             "support",
             "The entity answer is grounded and matches the fact's exact-name target despite the initial verifier mismatch.",
+            {"explicit_conflict": False},
+        )
+
+    if (
+        label in {"contradict", "insufficient"}
+        and answer_status == "supported"
+        and _clean_text(answer).lower() != "insufficient"
+        and grounded
+        and all_required_satisfied
+        and (not has_textual_targets or all_textual_satisfied)
+        and not constraint_eval.get("explicit_conflict", False)
+    ):
+        return (
+            "support",
+            "The entity answer is grounded and satisfies the fact's structured constraints despite the initial target mismatch.",
             {"explicit_conflict": False},
         )
 
@@ -479,6 +542,8 @@ def verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gol
         grounded=grounded,
         constraint_eval=constraint_eval,
         metadata=metadata,
+        fact_text=fact.get("text", ""),
+        evidence_span=evidence_span,
     )
 
     if (
@@ -491,6 +556,7 @@ def verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gol
         and constraint_eval.get("all_required_satisfied", False)
         and not constraint_eval.get("explicit_conflict", False)
         and exact_names_recoverable_from_eval(constraint_eval)
+        and contradicted_answer_can_be_recovered(fact.get("text", ""), evidence_span, constraint_eval)
         and fact_span_coverage_match(fact.get("text", ""), evidence_span)
     ):
         return (
@@ -503,26 +569,40 @@ def verify_relation_yesno(fact, qitem, answer, answer_status, evidence_span, gol
 
 
 
-def verify_time_wh(fact, answer_status, constraint_eval):
+def verify_time_wh(fact, answer_status, constraint_eval, evidence_span="", gold_evidence=""):
     negated = verify_helpers.contains_negation(fact)
     matched = constraint_eval["checks"]["time"].get("match")
     if matched is True:
         return ("contradict" if negated else "support"), "The extracted time value matches the time constraint.", {"explicit_conflict": False}
     if matched is False and (fact.get("constraint", {}) or {}).get("time"):
         return ("support" if negated else "contradict"), "The extracted time value conflicts with the time constraint.", {"explicit_conflict": True}
+    if (
+        not (fact.get("constraint", {}) or {}).get("time")
+        and answer_status == "supported"
+        and verify_helpers.span_grounded_in_evidence(evidence_span, gold_evidence)
+        and any(verify_helpers.looks_temporal_text(text) for text in constraint_eval["checks"]["time"].get("observed", []))
+    ):
+        return ("contradict" if negated else "support"), "The answer provides a grounded time value for a fact with no explicit target time constraint.", {"explicit_conflict": False}
     if answer_status in {"insufficient", "api_error"}:
         return "insufficient", "The answer does not provide enough temporal information.", {"explicit_conflict": False}
     return "insufficient", "The answer does not determine the time constraint.", {"explicit_conflict": False}
 
 
 
-def verify_quantity_wh(fact, answer_status, constraint_eval):
+def verify_quantity_wh(fact, answer_status, constraint_eval, evidence_span="", gold_evidence=""):
     negated = verify_helpers.contains_negation(fact)
     matched = constraint_eval["checks"]["quantity"].get("match")
     if matched is True:
         return ("contradict" if negated else "support"), "The extracted quantity value matches the quantity constraint.", {"explicit_conflict": False}
     if matched is False:
         return ("support" if negated else "contradict"), "The extracted quantity value conflicts with the quantity constraint.", {"explicit_conflict": True}
+    if (
+        not (fact.get("constraint", {}) or {}).get("quantity")
+        and answer_status == "supported"
+        and verify_helpers.span_grounded_in_evidence(evidence_span, gold_evidence)
+        and any(verify_helpers.extract_numeric_values(text) for text in constraint_eval["checks"]["quantity"].get("observed", []))
+    ):
+        return ("contradict" if negated else "support"), "The answer provides a grounded quantity value for a fact with no explicit target quantity constraint.", {"explicit_conflict": False}
     if answer_status in {"insufficient", "api_error"}:
         return "insufficient", "The answer does not provide enough quantity information.", {"explicit_conflict": False}
     return "insufficient", "The answer does not determine the quantity constraint.", {"explicit_conflict": False}
@@ -647,9 +727,9 @@ def verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence):
     if question_type == "relation_yesno":
         verification_label, reason, verifier_metadata = verify_relation_yesno(bound_fact, qitem, answer, answer_status, evidence_span, gold_evidence, extracted_values, constraint_eval)
     elif question_type == "time_wh":
-        verification_label, reason, verifier_metadata = verify_time_wh(fact, answer_status, constraint_eval)
+        verification_label, reason, verifier_metadata = verify_time_wh(fact, answer_status, constraint_eval, evidence_span, gold_evidence)
     elif question_type == "quantity_wh":
-        verification_label, reason, verifier_metadata = verify_quantity_wh(fact, answer_status, constraint_eval)
+        verification_label, reason, verifier_metadata = verify_quantity_wh(fact, answer_status, constraint_eval, evidence_span, gold_evidence)
     elif question_type == "entity_wh":
         verification_label, reason = verify_helpers.verify_entity_wh(
             fact={"text": bound_fact_text},
