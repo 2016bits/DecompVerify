@@ -2,8 +2,6 @@ import os
 import re
 import json
 import argparse
-import importlib.util
-from pathlib import Path
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -11,11 +9,7 @@ from difflib import SequenceMatcher
 
 from tqdm import tqdm
 
-
-_HELPER_PATH = Path(__file__).with_name("2.py")
-_HELPER_SPEC = importlib.util.spec_from_file_location("verify_helpers", _HELPER_PATH)
-verify_helpers = importlib.util.module_from_spec(_HELPER_SPEC)
-_HELPER_SPEC.loader.exec_module(verify_helpers)
+import verify_helpers
 
 
 
