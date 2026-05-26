@@ -1,6 +1,9 @@
 import argparse
+import copy
+import hashlib
 import json
 import os
+import random
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -45,6 +48,11 @@ def to_claim_label(fact_label):
     if fact_label == CONTRADICTED:
         return "refutes", "refutes"
     return "not enough information", "refutes"
+
+
+# ---------------------------------------------------------------------------
+# Existing baselines
+# ---------------------------------------------------------------------------
 
 
 def aggregate_majority_vote(verifications):
@@ -126,18 +134,186 @@ def aggregate_no_critical_gate(verifications):
     }
 
 
+# ---------------------------------------------------------------------------
+# Group 1: critical-marker semantics (LLM-free aggregate-only ablations)
+# ---------------------------------------------------------------------------
+
+
+def _claim_seed(data):
+    base = str(data.get("id") or data.get("claim") or "")
+    digest = hashlib.md5(base.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _critical_rewrite_random(verifications, seed):
+    n = len(verifications)
+    target_n = sum(1 for v in verifications if v.get("critical", False))
+    if n == 0:
+        return [], 0, 0
+    rng = random.Random(seed)
+    indices = list(range(n))
+    rng.shuffle(indices)
+    chosen = set(indices[:target_n])
+    new_verifs = []
+    flipped = 0
+    for idx, v in enumerate(verifications):
+        new = dict(v)
+        new_crit = idx in chosen
+        if new_crit != v.get("critical", False):
+            flipped += 1
+        new["critical"] = new_crit
+        new_verifs.append(new)
+    return new_verifs, target_n, flipped
+
+
+def _critical_rewrite_flip(verifications):
+    new_verifs = []
+    flipped = 0
+    for v in verifications:
+        new = dict(v)
+        new["critical"] = not bool(v.get("critical", False))
+        flipped += 1
+        new_verifs.append(new)
+    return new_verifs, sum(1 for x in new_verifs if x["critical"]), flipped
+
+
+def _critical_rewrite_structural(verifications):
+    """Define critical structurally: a fact is critical iff it is not relied
+    on by any other fact (i.e. it sits at the top of the rely_on chain and is
+    therefore directly referenced by the claim aggregation). All upstream
+    facts in the chain are demoted to non-critical."""
+    relied_on_by = set()
+    for v in verifications:
+        for ref in v.get("rely_on", []) or []:
+            relied_on_by.add(ref)
+    new_verifs = []
+    flipped = 0
+    for v in verifications:
+        new = dict(v)
+        new_crit = v.get("fact_id") not in relied_on_by
+        if new_crit != v.get("critical", False):
+            flipped += 1
+        new["critical"] = new_crit
+        new_verifs.append(new)
+    return new_verifs, sum(1 for x in new_verifs if x["critical"]), flipped
+
+
+def aggregate_with_rewritten_critical(verifications, mode, data):
+    if mode == "random_critical":
+        new_verifs, n_crit, flipped = _critical_rewrite_random(verifications, _claim_seed(data))
+        reason_tag = "Ablation: critical markers were randomized while keeping the original critical count."
+    elif mode == "flip_critical":
+        new_verifs, n_crit, flipped = _critical_rewrite_flip(verifications)
+        reason_tag = "Ablation: critical and non-critical markers were swapped."
+    elif mode == "structural_critical":
+        new_verifs, n_crit, flipped = _critical_rewrite_structural(verifications)
+        reason_tag = "Ablation: critical markers were recomputed structurally (terminal facts only)."
+    else:
+        raise ValueError(f"Unknown critical-rewrite mode: {mode}")
+
+    aggregation_result = aggregate_labels.aggregate_labels(new_verifs)
+    aggregation_result["aggregation_mode"] = mode
+    aggregation_result["critical_rewrite"] = {
+        "mode": mode,
+        "original_critical_count": sum(1 for v in verifications if v.get("critical")),
+        "rewritten_critical_count": n_crit,
+        "labels_flipped": flipped,
+        "note": reason_tag,
+    }
+    base_reason = aggregation_result.get("decision_reason", "")
+    aggregation_result["decision_reason"] = f"[{mode}] " + base_reason if base_reason else reason_tag
+    return aggregation_result
+
+
+# ---------------------------------------------------------------------------
+# Group 3A: dependency removed at aggregate stage only
+# ---------------------------------------------------------------------------
+
+
+def aggregate_wo_rely_on(verifications):
+    rewritten = []
+    removed_edges = 0
+    for v in verifications:
+        new = dict(v)
+        removed_edges += len(v.get("rely_on", []) or [])
+        new["rely_on"] = []
+        rewritten.append(new)
+    aggregation_result = aggregate_labels.aggregate_labels(rewritten)
+    aggregation_result["aggregation_mode"] = "wo_rely_on_aggregate_only"
+    aggregation_result["rely_on_removed"] = {
+        "removed_dependency_edges": removed_edges,
+        "note": (
+            "Ablation: rely_on edges are erased before aggregation. Role weight no longer "
+            "distinguishes dependent vs root non-critical facts; the rest of the pipeline "
+            "(decomposition, question generation, answering, verification) is unchanged."
+        ),
+    }
+    return aggregation_result
+
+
+# ---------------------------------------------------------------------------
+# Group 4B: decomp + verify but with no aggregation heuristics (plain AND)
+# ---------------------------------------------------------------------------
+
+
+def aggregate_decomp_no_aggregation(verifications):
+    """A clean alternative to majority_vote: keep decomposition and per-fact
+    verification, but discard every aggregation heuristic. The claim is
+    SUPPORTS iff every fact's effective label is SUPPORTED; otherwise REFUTES.
+    No critical gate, no NEI tolerance, no score, no tie-breaking.
+    """
+    counts = label_counts(verifications)
+    if not verifications:
+        final_label, final_label_binary = "refutes", "refutes"
+        reason = "Ablation: no atomic facts; claim defaults to refutes under plain AND."
+    elif counts["support"] == len(verifications):
+        final_label = "supports"
+        final_label_binary = "supports"
+        reason = "Ablation: plain AND aggregation -- every fact is supported."
+    else:
+        final_label = "refutes"
+        final_label_binary = "refutes"
+        reason = (
+            "Ablation: plain AND aggregation -- at least one fact is not supported. "
+            "No critical gate, no NEI tolerance, no scoring heuristic is applied."
+        )
+    return {
+        "final_label": final_label,
+        "final_label_binary": final_label_binary,
+        "decision_reason": reason,
+        "aggregation_mode": "decomp_no_aggregation",
+        "counts": counts,
+        "per_fact_records": simple_fact_records(verifications),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+
+CRITICAL_REWRITE_MODES = {"random_critical", "flip_critical", "structural_critical"}
+
+
+def run_aggregation(verifications, mode, data):
+    if mode == "full":
+        return aggregate_labels.aggregate_labels(verifications)
+    if mode == "majority_vote":
+        return aggregate_majority_vote(verifications)
+    if mode == "no_critical_gate":
+        return aggregate_no_critical_gate(verifications)
+    if mode in CRITICAL_REWRITE_MODES:
+        return aggregate_with_rewritten_critical(verifications, mode, data)
+    if mode == "wo_rely_on_aggregate_only":
+        return aggregate_wo_rely_on(verifications)
+    if mode == "decomp_no_aggregation":
+        return aggregate_decomp_no_aggregation(verifications)
+    raise ValueError(f"Unsupported aggregation_mode: {mode}")
+
+
 def process_data_item(data, aggregation_mode):
     verifications = aggregate_labels.normalize_verifications(data)
-
-    if aggregation_mode == "full":
-        aggregation_result = aggregate_labels.aggregate_labels(verifications)
-    elif aggregation_mode == "majority_vote":
-        aggregation_result = aggregate_majority_vote(verifications)
-    elif aggregation_mode == "no_critical_gate":
-        aggregation_result = aggregate_no_critical_gate(verifications)
-    else:
-        raise ValueError(f"Unsupported aggregation_mode: {aggregation_mode}")
-
+    aggregation_result = run_aggregation(verifications, aggregation_mode, data)
     out = dict(data)
     out["aggregation_result"] = aggregation_result
     return out
@@ -187,9 +363,21 @@ def main(args):
     print("Program finished at:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
+SUPPORTED_MODES = [
+    "full",
+    "majority_vote",
+    "no_critical_gate",
+    "random_critical",
+    "flip_critical",
+    "structural_critical",
+    "wo_rely_on_aggregate_only",
+    "decomp_no_aggregation",
+]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--aggregation_mode", type=str, choices=["full", "majority_vote", "no_critical_gate"], default="majority_vote")
+    parser.add_argument("--aggregation_mode", type=str, choices=SUPPORTED_MODES, default="majority_vote")
     parser.add_argument("--dataset", type=str, default="HOVER")
     parser.add_argument("--data_type", type=str, default="dev")
     parser.add_argument("--class_num", type=str, default="2")

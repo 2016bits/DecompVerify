@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,11 @@ def status_to_fact_label(answer_status):
     if answer_status in {INSUFFICIENT_STATUS, API_ERROR_STATUS}:
         return "insufficient"
     return "insufficient"
+
+
+# ---------------------------------------------------------------------------
+# Existing baseline: wo_constraint_full (drop the whole constraint stack)
+# ---------------------------------------------------------------------------
 
 
 def verify_one_fact_no_constraint(fact, qitem, aitem, final_bindings, gold_evidence):
@@ -80,7 +86,7 @@ def verify_one_fact_no_constraint(fact, qitem, aitem, final_bindings, gold_evide
         "value_checks": {},
         "adjudication": adjudication,
         "ablation": {
-            "mode": "wo_constraint_aware_verification",
+            "mode": "wo_constraint_full",
             "used_constraint_fields": False,
             "used_answer_status_only": True,
         },
@@ -116,7 +122,7 @@ def process_data_item_no_constraint(data):
             "verifications": fact_verification,
         },
         "verification_ablation": {
-            "mode": "wo_constraint_aware_verification",
+            "mode": "wo_constraint_full",
             "answer_status_mapping": {
                 "supported": "support",
                 "contradicted": "contradict",
@@ -125,6 +131,163 @@ def process_data_item_no_constraint(data):
             },
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Group 2: sub-mechanism ablations of the constraint stack
+# ---------------------------------------------------------------------------
+#
+# These three ablations all reuse verify_atomic_facts.verify_one_fact via
+# monkey-patching its building blocks. This way every other piece of logic
+# (question_type dispatch, evidence grounding, etc.) stays in sync with the
+# canonical implementation.
+
+
+def _empty_constraint_eval(constraint, answer, evidence_span, extracted_values, fact_text):
+    """Stand-in for evaluate_constraint_checks that produces a neutral shape.
+
+    Every check is reported as `match=None` with no targets, so downstream
+    code that consults `constraint_eval["checks"][...]` will see "nothing to
+    verify". `explicit_conflict` is False so the second-pass adjudication
+    cannot use value-level conflicts."""
+    neutral_check = {"match": None, "targets": [], "details": {}}
+    return {
+        "checks": {
+            "time": dict(neutral_check),
+            "quantity": dict(neutral_check),
+            "location": dict(neutral_check),
+            "comparison": dict(neutral_check),
+            "unique_modifier": dict(neutral_check),
+            "title_role": dict(neutral_check),
+            "exact_name": {"match": None, "match_all": None, "targets": [], "details": {}},
+        },
+        "required_keys": [],
+        "all_required_satisfied": True,
+        "explicit_conflict": False,
+        "textual_required_keys": [],
+        "all_textual_satisfied": True,
+        "any_textual_missed": False,
+        "exact_name_match": None,
+        "exact_name_all_match": None,
+    }
+
+
+def _noop_second_pass(fact, qitem, answer_status, initial_label, evidence_span,
+                      gold_evidence, constraint_eval, verifier_metadata):
+    return {
+        "triggered": False,
+        "final_label": initial_label,
+        "reason": "Ablation: second-pass adjudication disabled (wo_adjudication).",
+    }
+
+
+@contextlib.contextmanager
+def _patch(target_module, attr, replacement):
+    sentinel = object()
+    original = getattr(target_module, attr, sentinel)
+    setattr(target_module, attr, replacement)
+    try:
+        yield
+    finally:
+        if original is sentinel:
+            delattr(target_module, attr)
+        else:
+            setattr(target_module, attr, original)
+
+
+def _force_literal_polarity(fact, qitem, aitem, final_bindings, gold_evidence):
+    """Wrap verify_one_fact while forcing question_polarity='literal_fact'.
+
+    Negated facts/questions still parse normally via verify_helpers, but the
+    polarity tag itself stops biasing relation_yesno mode inference."""
+    patched_qitem = dict(qitem or {})
+    patched_qitem["question_polarity"] = "literal_fact"
+    return verify_atomic_facts.verify_one_fact(fact, patched_qitem, aitem, final_bindings, gold_evidence)
+
+
+def _verify_with_disabled_value_checks(fact, qitem, aitem, final_bindings, gold_evidence):
+    with _patch(verify_atomic_facts, "evaluate_constraint_checks", _empty_constraint_eval):
+        return verify_atomic_facts.verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence)
+
+
+def _verify_with_disabled_adjudication(fact, qitem, aitem, final_bindings, gold_evidence):
+    with _patch(verify_atomic_facts, "run_second_pass_adjudication", _noop_second_pass):
+        return verify_atomic_facts.verify_one_fact(fact, qitem, aitem, final_bindings, gold_evidence)
+
+
+def _verify_with_no_runtime_binding(fact, qitem, aitem, final_bindings, gold_evidence):
+    """Group 3B: keep rely_on structure but stop substituting ?slot tokens at
+    verify time. The verifier sees the un-bound fact / question text."""
+    return verify_atomic_facts.verify_one_fact(fact, qitem, aitem, {}, gold_evidence)
+
+
+# ---------------------------------------------------------------------------
+# Generic process_data_item that swaps verify_one_fact for a given variant
+# ---------------------------------------------------------------------------
+
+
+VARIANT_TO_VERIFIER = {
+    "wo_adjudication": _verify_with_disabled_adjudication,
+    "wo_value_checks": _verify_with_disabled_value_checks,
+    "wo_polarity": _force_literal_polarity,
+    "wo_runtime_binding": _verify_with_no_runtime_binding,
+}
+
+
+def process_data_item_variant(data, mode):
+    if mode == "wo_constraint_full":
+        return process_data_item_no_constraint(data)
+
+    verifier = VARIANT_TO_VERIFIER[mode]
+    fact_map, q_map, a_map, final_bindings = verify_atomic_facts.build_maps(data)
+    ordered_fact_ids = [fact.get("id") for fact in (data.get("decomposition", {}) or {}).get("atomic_facts", []) or []]
+
+    if mode == "wo_runtime_binding":
+        # Aggregator will use the same view of bindings; emit empty to avoid
+        # leaking placeholder substitutions through downstream consumers.
+        emitted_bindings = {}
+    else:
+        emitted_bindings = final_bindings
+
+    fact_verification = []
+    gold_evidence = data.get("gold_evidence", data.get("evidence", ""))
+    for fact_id in ordered_fact_ids:
+        fact = fact_map.get(fact_id, {})
+        qitem = q_map.get(fact_id, {})
+        aitem = a_map.get(fact_id, {})
+        v = verifier(fact, qitem, aitem, final_bindings, gold_evidence)
+        v.setdefault("ablation", {})
+        v["ablation"]["mode"] = mode
+        fact_verification.append(v)
+
+    return {
+        "id": data["id"],
+        "claim": data["claim"],
+        "gold_evidence": gold_evidence,
+        "num_hops": data.get("num_hops", None),
+        "label": data.get("label", None),
+        "decomposition": data.get("decomposition", {}),
+        "question_plan": data.get("question_plan", {}),
+        "answer_result": data.get("answer_result", {}),
+        "fact_verification": {
+            "claim": data["claim"],
+            "final_bindings": emitted_bindings,
+            "verifications": fact_verification,
+        },
+        "verification_ablation": {
+            "mode": mode,
+            "description": _MODE_DESCRIPTIONS[mode],
+        },
+    }
+
+
+_MODE_DESCRIPTIONS = {
+    "wo_constraint_full": "Drop the entire constraint stack; map answer.status directly to fact label.",
+    "wo_adjudication": "Skip the second-pass adjudication; adjudicated_label := verification_label.",
+    "wo_value_checks": "Replace evaluate_constraint_checks with a no-op; type-specific verifiers run on empty checks.",
+    "wo_polarity": "Force question_polarity='literal_fact' so the relation_yesno polarity branch never fires.",
+    "wo_runtime_binding": "Keep rely_on structure but do not substitute ?slot placeholders before verification.",
+}
 
 
 def resolve_path(path, args):
@@ -140,6 +303,18 @@ def resolve_path(path, args):
     )
 
 
+SUPPORTED_MODES = [
+    "full",
+    "wo_constraint_full",
+    "wo_adjudication",
+    "wo_value_checks",
+    "wo_polarity",
+    "wo_runtime_binding",
+    # Back-compat alias for the old shell scripts.
+    "no_constraint",
+]
+
+
 def main(args):
     in_path = resolve_path(args.in_path, args)
 
@@ -147,12 +322,14 @@ def main(args):
         raws = json.load(file_obj)
     raws = raws[args.start:args.end]
 
-    if args.mode == "full":
+    mode = args.mode
+    if mode == "no_constraint":
+        mode = "wo_constraint_full"
+
+    if mode == "full":
         partial_func = partial(verify_atomic_facts.process_data_item)
-    elif args.mode == "no_constraint":
-        partial_func = partial(process_data_item_no_constraint)
     else:
-        raise ValueError(f"Unsupported mode: {args.mode}")
+        partial_func = partial(process_data_item_variant, mode=mode)
 
     results = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
@@ -179,7 +356,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, choices=["full", "no_constraint"], default="no_constraint")
+    parser.add_argument("--mode", type=str, choices=SUPPORTED_MODES, default="wo_constraint_full")
     parser.add_argument("--dataset", type=str, default="HOVER")
     parser.add_argument("--data_type", type=str, default="dev")
     parser.add_argument("--class_num", type=str, default="2")

@@ -65,7 +65,7 @@ def build_client_and_model(plan, port='8370'):
         if not api_key:
             raise ValueError("BIT_API_KEY is not set in environment variables.")
         client = OpenAI(api_key=api_key, base_url="https://maas.bit.edu.cn/v1")
-        return client, "qwen3-235b", None, {}, 8192, 0.7
+        return client, "DeepSeek-V3.2", None, {}, 8192, 0.7
 
     raise ValueError(
         f"Unsupported plan: {plan}. Supported plans are: local, azure, azure_gpt4o, qc_plan, qwen_plan"
