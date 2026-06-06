@@ -3,9 +3,9 @@ data
 Meta-Llama-3-70B-Instruct-AutoAWQ-4bit
 1.py
 2.py
-scripts/prompts/__pycache__
-scripts/__pycache__/
-scripts/utils/__pycache__
+__pycache__/
+**/__pycache__/
+*.py[cod]
 scripts/llm
 .codex
 scripts/run_scripts

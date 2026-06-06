@@ -232,6 +232,16 @@ def merge_bindings(current_bindings, new_bindings):
 
 
 def extract_initial_bindings(decomposition):
+    """Seed bindings from ``entity_slots`` values.
+
+    We drop values that still contain unresolved ``?`` variables – those
+    propagate the placeholder into every downstream question (this is
+    what made the Scorpiones 4-hop chain fail: ``?animal_1`` was seeded
+    with ``"the animal discussed by ?naturalist_1 ..."`` and the LLM
+    then judged ``f4`` against an Eight-Legs band sentence). Descriptive
+    values without placeholders (e.g. ``"1st Chancellor of Germany"``)
+    are kept – they still serve as useful BM25 anchors downstream.
+    """
     entity_slots = (decomposition or {}).get("entity_slots", {}) or {}
     bindings = {}
     for slot, raw in entity_slots.items():
@@ -242,8 +252,11 @@ def extract_initial_bindings(decomposition):
             value = _clean_text(raw.get("value", ""))
         else:
             value = _clean_text(raw)
-        if value:
-            bindings[slot] = value
+        if not value:
+            continue
+        if VAR_PATTERN.search(value):
+            continue
+        bindings[slot] = value
     return bindings
 
 
@@ -463,6 +476,16 @@ def fallback_answer_result(fact_id, used_question, error_type="api_error"):
 def answer_one_question(claim, evidence, atomic_fact, question_item, current_bindings, plan, port):
     filled_fact = replace_placeholders_in_obj(atomic_fact, current_bindings)
     filled_question_item = replace_placeholders_in_obj(question_item, current_bindings)
+    # Keep the canonical slot name intact – ``replace_placeholders_in_obj``
+    # is a blanket text substitution that also rewrites the
+    # ``answer_slot`` field itself (e.g. ``"?animal_1"`` -> the value of
+    # that placeholder). When that happens ``normalize_bindings_update``
+    # stores the LLM's resolved value under a natural-language key and
+    # downstream facts never see ``?animal_1`` bound, so a chain like
+    # f3:resolves-scorpion → f4:"does ?animal_1 have eight legs" fails.
+    for slot_field in ("answer_slot", "fact_id"):
+        if slot_field in question_item:
+            filled_question_item[slot_field] = question_item[slot_field]
     used_question = _clean_text(filled_question_item.get("main_question", ""))
     fact_id = atomic_fact.get("id", "")
 
@@ -503,9 +526,48 @@ def order_question_items(question_items):
 
 
 
+def _scoped_evidence(global_evidence, per_fact_evidence, fact_id, rely_on):
+    """Compose the evidence string for a single atomic fact.
+
+    Strategy
+    --------
+    1. Lead with the current fact's own selected sentences (the
+       cross-fact-distractor fix that solved e.g. "Boone HS" vs
+       "Satellite HS" mascot confusion).
+    2. Append parents' selected sentences so bindings (such as
+       ``?animal_1 = scorpion``) propagate.
+    3. *Always* tail with the global evidence as a safety net. The v2
+       run revealed cases like the f7 e-Borders fact where the per-fact
+       rescue picked an irrelevant high-PPR sentence; in those cases
+       the real answer was in another fact's slice, so the LLM needs
+       to see the full pool. Putting it at the tail keeps the focused
+       per-fact context first so the LLM still prefers it for the
+       common case.
+    """
+    if not isinstance(per_fact_evidence, dict) or not per_fact_evidence:
+        return global_evidence
+    chunks: list[str] = []
+    seen: set[str] = set()
+
+    def _push(text: str) -> None:
+        text = (text or "").strip()
+        if text and text not in seen:
+            chunks.append(text)
+            seen.add(text)
+
+    _push(per_fact_evidence.get(fact_id, ""))
+    for parent_id in rely_on or []:
+        _push(per_fact_evidence.get(parent_id, ""))
+    _push(global_evidence)
+    if not chunks:
+        return global_evidence
+    return "\n".join(chunks)
+
+
 def generate_answers_for_item(data, plan, port):
     claim = data["claim"]
     evidence = data["gold_evidence"]
+    per_fact_evidence = data.get("retrieved_evidence_per_fact") or {}
     decomposition = data.get("decomposition", {}) or {}
     question_plan = data.get("question_plan", {}) or {}
 
@@ -530,9 +592,16 @@ def generate_answers_for_item(data, plan, port):
             "critical_reasons": qitem.get("critical_reasons", []),
         })
 
+        fact_evidence = _scoped_evidence(
+            global_evidence=evidence,
+            per_fact_evidence=per_fact_evidence,
+            fact_id=fact_id,
+            rely_on=qitem.get("rely_on", []),
+        )
+
         result = answer_one_question(
             claim=claim,
-            evidence=evidence,
+            evidence=fact_evidence,
             atomic_fact=atomic_fact,
             question_item=qitem,
             current_bindings=final_bindings,
@@ -558,14 +627,37 @@ def generate_answers_for_item(data, plan, port):
 
 
 
-def process_data_item(data, plan, port):
+def _pick_evidence(data, evidence_source):
+    """Return the evidence string for answer generation.
+
+    ``evidence_source`` selects between gold (default) and retrieved
+    evidence. When ``retrieved`` is requested but missing we fall back
+    to gold so the pipeline never silently runs with no context.
+    """
+    source = (evidence_source or "gold").lower()
+    gold = data.get("gold_evidence", data.get("evidence", "")) or ""
+    retrieved = data.get("retrieved_evidence", "") or ""
+    if source == "retrieved":
+        if retrieved:
+            return retrieved, "retrieved"
+        return gold, "gold_fallback"
+    if source == "both":
+        if retrieved and gold:
+            return f"{retrieved}\n{gold}", "both"
+        return (retrieved or gold), ("retrieved" if retrieved else "gold")
+    return gold, "gold"
+
+
+def process_data_item(data, plan, port, evidence_source="gold"):
     decomposition = data.get("decomposition", {"claim": data["claim"], "atomic_facts": []})
     question_plan = data.get("question_plan", {"question_items": []})
+    evidence_text, evidence_kind = _pick_evidence(data, evidence_source)
 
     answer_result, answer_issues = generate_answers_for_item(
         {
             "claim": data["claim"],
-            "gold_evidence": data.get("gold_evidence", data.get("evidence", "")),
+            "gold_evidence": evidence_text,
+            "retrieved_evidence_per_fact": data.get("retrieved_evidence_per_fact") or {},
             "decomposition": decomposition,
             "question_plan": question_plan,
         },
@@ -577,6 +669,8 @@ def process_data_item(data, plan, port):
         "id": data["id"],
         "claim": data["claim"],
         "gold_evidence": data.get("gold_evidence", data.get("evidence", "")),
+        "retrieved_evidence": data.get("retrieved_evidence", ""),
+        "evidence_used": evidence_kind,
         "num_hops": data.get("num_hops", None),
         "label": data.get("label", None),
         "decomposition": decomposition,
@@ -610,13 +704,16 @@ def main(args):
             "id": data["id"],
             "claim": data["claim"],
             "gold_evidence": data.get("gold_evidence", data.get("evidence", "")),
+            "retrieved_evidence": data.get("retrieved_evidence", ""),
+            "retrieved_evidence_per_fact": data.get("retrieved_evidence_per_fact") or {},
             "num_hops": data.get("num_hops", None),
             "label": data.get("label", None),
             "decomposition": data.get("decomposition", {"claim": data["claim"], "atomic_facts": []}),
             "question_plan": data.get("question_plan", {"question_items": []}),
         })
 
-    partial_func = partial(process_data_item, plan=args.plan, port=args.port)
+    partial_func = partial(process_data_item, plan=args.plan, port=args.port,
+                           evidence_source=args.evidence_source)
     results = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = [executor.submit(partial_func, item) for item in dataset]
@@ -663,4 +760,8 @@ if __name__ == "__main__":
     parser.add_argument("--t", type=str, default="")
     parser.add_argument("--in_path", type=str, default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_questions_[T][S]_[E].json")
     parser.add_argument("--out_path", type=str, default="./data/[DATA]/[PLAN]/[TYPE]_[CLASS]_answers_[T][S]_[E].json")
+    parser.add_argument("--evidence_source", type=str, default="gold",
+                        choices=["gold", "retrieved", "both"],
+                        help="Which evidence to feed to the answer model. "
+                             "'retrieved' falls back to gold if absent.")
     main(parser.parse_args())
