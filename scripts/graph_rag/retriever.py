@@ -32,7 +32,14 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+# Type alias for the optional LLM-binding hook. Caller builds a closure
+# that takes (qitem, top_candidates, current_bindings) and returns either
+# ``(slot, value)`` or ``None``. Keeping the OpenAI dependency outside this
+# module makes the retriever drop-in testable.
+LLMBindingFn = Callable[[dict, List[dict], Dict[str, str]],
+                        Optional[Tuple[str, str]]]
 
 import numpy as np
 
@@ -45,9 +52,79 @@ from .ppr import personalised_pagerank
 
 
 VAR_PATTERN = re.compile(r"\?[A-Za-z_][A-Za-z0-9_]*")
+_YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^)]+\)\s*$")
 
 
 # ---------------------------------------------------------------------------- helpers
+def _title_qualifiers(title: str) -> List[str]:
+    """Return the parenthetical qualifiers of a wiki title.
+
+    e.g. ``"Aamer Iqbal (cricketer, born 1990)"`` -> ``["cricketer, born 1990"]``.
+    """
+    return re.findall(r"\(([^)]+)\)", title or "")
+
+
+def _title_bare(title: str) -> str:
+    """Strip the trailing parenthetical from a title."""
+    return _TRAILING_PAREN_RE.sub("", title or "").strip()
+
+
+def _constraint_year_conflict(title: str, qitem: dict) -> bool:
+    """True iff title's parenthetical and fact constraint both name a year, and they disagree.
+
+    Drives the S2 hard filter that excludes ``(... born 1973)`` candidates
+    when the fact constraint says ``time=["1990"]``.
+    """
+    quals = _title_qualifiers(title)
+    if not quals:
+        return False
+    qual_text = " ".join(quals).lower()
+    title_years = set(_YEAR_RE.findall(qual_text))
+    if not title_years:
+        return False
+    cons = qitem.get("constraint") or {}
+    cons_years: set = set()
+    for v in cons.get("time", []) or []:
+        if isinstance(v, str):
+            cons_years.update(_YEAR_RE.findall(v))
+    if not cons_years:
+        return False
+    return not (title_years & cons_years)
+
+
+_BORN_YEAR_RE = re.compile(r"born\s+(1[89]\d{2}|20\d{2})", re.IGNORECASE)
+
+
+def _is_constraint_anchor(title: str, qitem: dict) -> bool:
+    """Return True if the title is a strong constraint anchor.
+
+    Specifically: either the title body contains a constraint ``exact_name``
+    string, or its parenthetical disambiguator carries a ``born YYYY`` token
+    that matches a constraint year. A bare ``(1951)`` in a title is **not**
+    enough on its own — too many films from the same year share that pattern
+    and would all get anchored equally.
+    """
+    tl = (title or "").lower()
+    cons = qitem.get("constraint") or {}
+    for v in cons.get("exact_name", []) or []:
+        if isinstance(v, str) and v.strip() and v.lower() in tl:
+            return True
+    quals = _title_qualifiers(title)
+    if quals:
+        cons_years: set = set()
+        for v in cons.get("time", []) or []:
+            if isinstance(v, str):
+                cons_years.update(_YEAR_RE.findall(v))
+        if cons_years:
+            for q in quals:
+                m = _BORN_YEAR_RE.search(q)
+                if m and m.group(1) in cons_years:
+                    return True
+    return False
+
+
+
 def _topological_order(question_items: Sequence[dict]) -> List[dict]:
     """Topologically sort question items by ``rely_on`` edges."""
     by_id = {q.get("fact_id"): q for q in question_items}
@@ -79,8 +156,14 @@ def _topological_order(question_items: Sequence[dict]) -> List[dict]:
 def _fact_search_text(qitem: dict, bindings: Dict[str, str]) -> str:
     base = qitem.get("fact_text") or qitem.get("main_question") or ""
     # Best-effort binding substitution to lift "?province_1" to a real name.
+    # Placeholder-style bindings (LLM descriptions like "a Catalan football
+    # club") are skipped — substituting them would dilute the query.
     def _sub(m):
-        return bindings.get(m.group(0), m.group(0))
+        token = m.group(0)
+        v = bindings.get(token)
+        if v is None or _is_placeholder_binding(v):
+            return token
+        return v
     base = VAR_PATTERN.sub(_sub, base)
     hints = " ".join(qitem.get("search_hints", []) or [])
     return f"{base} {hints}".strip()
@@ -401,6 +484,14 @@ def _retrieve_for_fact(
     )
     target_keys = {s.lower() for s in target_surfaces}
     anchor_titles = _identify_anchor_titles(qitem, graph, target_surfaces)
+    # S2: constraint-based anchors – titles whose parens match the fact's
+    # year or whose body contains an ``exact_name`` constraint. Distinct from
+    # entity anchors so a stale parent-binding can't generate a false anchor
+    # for an unrelated year constraint.
+    constraint_anchor_titles = {
+        t for t in graph.title_to_node if _is_constraint_anchor(t, qitem)
+    }
+    all_anchor_titles = anchor_titles | constraint_anchor_titles
 
     # Score candidates: combine PPR mass with cheap surface checks. We
     # deliberately skip a heavy cross-encoder here – the per-fact graph
@@ -427,8 +518,19 @@ def _retrieve_for_fact(
             if sid:
                 candidate_sids.add(sid)
     for sent in graph.sentences:
-        if sent.title in anchor_titles:
+        if sent.title in all_anchor_titles:
             candidate_sids.add(sent.sid)
+
+    # S2: pre-compute which sentence titles conflict with a year constraint.
+    # Apply as a soft penalty in the composite score (rather than a hard
+    # exclude) so an edge case like ``f1 only retrieves 1973-tagged people``
+    # still has *something* to fall back on.
+    conflict_sids: set = set()
+    if qitem.get("constraint", {}).get("time"):
+        for sid in candidate_sids:
+            title = graph.sentences[graph.sid_to_idx[sid]].title
+            if _constraint_year_conflict(title, qitem):
+                conflict_sids.add(sid)
 
     candidates: List[dict] = []
     for sent in graph.sentences:
@@ -451,27 +553,30 @@ def _retrieve_for_fact(
         # and PPR signals, normalised into [0, 1].
         ce_score = 0.4 * sem_score + 0.4 * ent_score + 0.2 * cons_score
         ce_score = max(0.0, min(1.0, ce_score))
-        is_anchor = sent.title in anchor_titles
+        is_entity_anchor = sent.title in anchor_titles
+        is_constraint_anchor = sent.title in constraint_anchor_titles
+        is_anchor = is_entity_anchor or is_constraint_anchor
         composite = (
-            0.35 * sem_score
+            0.33 * sem_score
             + 0.30 * ent_score
-            + 0.15 * cons_score
-            + 0.20 * math.sqrt(max(ppr_mass, 0.0))
+            + 0.18 * cons_score
+            + 0.19 * math.sqrt(max(ppr_mass, 0.0))
         )
-        # Doc anchoring: a sentence from a doc whose title literally
-        # names one of the fact's target entities almost always beats
-        # a same-topic sentence from an unrelated doc. Large additive
-        # boost; non-anchor sentences from a doc that conflicts with
-        # one of the anchor's domain get a small penalty so they don't
-        # dominate the per-fact ranking.
+        # Doc anchoring: a sentence from a doc whose title literally names
+        # one of the fact's target entities or matches its constraint year
+        # almost always beats a same-topic sentence from an unrelated doc.
         if is_anchor:
             composite += 0.35
             ce_score = min(1.0, ce_score + 0.15)
-        elif anchor_titles:
-            # We have a clear target doc but this sentence isn't from
-            # it – suppress unless it directly mentions a target entity.
+        elif all_anchor_titles:
+            # We have a clear target doc but this sentence isn't from it –
+            # suppress unless it directly mentions a target entity.
             if not has_target:
                 composite -= 0.20
+        # S2 soft penalty for sentences whose doc title disagrees on year.
+        if sid in conflict_sids:
+            composite -= 0.50
+            ce_score = max(0.0, ce_score - 0.20)
 
         direct_pass = _direct_support_pass(
             ce_score=ce_score,
@@ -516,6 +621,223 @@ def _retrieve_for_fact(
     )
 
 
+# ---------------------------------------------------------------------------- S1: binding propagation
+_REL_PRONOUNS = (" who ", " whom ", " which ", " that ", " where ", " whose ")
+_BAD_LEADERS = {
+    "under", "over", "above", "below", "after", "before", "during", "while",
+    "when", "where", "through", "within", "without", "across", "beyond",
+    "between", "among", "into", "onto", "upon", "since", "until", "till",
+}
+
+
+def _is_placeholder_binding(value: str) -> bool:
+    """Decide whether an existing binding is a description rather than an entity.
+
+    LLM-generated ``entity_slots`` often contain strings like
+    ``"the German naturalist whom boiga kraepelini is named after"`` or
+    ``"a Catalan football club"`` instead of resolved wiki titles. We treat
+    those as overwritable so the per-fact retrieval can refine them.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return True
+    v = value.strip()
+    vl = v.lower()
+    words = v.split()
+    if len(words) >= 7:
+        return True
+    if vl.startswith(("a ", "an ")):
+        return True
+    if any(p in f" {vl} " for p in _REL_PRONOUNS):
+        return True
+    if vl.startswith("the "):
+        rest = words[1:]
+        small = {"of", "and", "in", "on", "for", "the", "a", "an"}
+        if not all(w[:1].isupper() or w.lower() in small for w in rest):
+            return True
+    # mostly lowercase prose
+    capitals = sum(1 for w in words if w[:1].isupper())
+    if capitals < (len(words) / 2):
+        return True
+    return False
+
+
+def _extract_binding(
+    qitem: dict,
+    fact_result: FactRetrieval,
+    current_bindings: Dict[str, str],
+    *,
+    min_composite: float = 0.30,
+) -> Optional[Tuple[str, str]]:
+    """Pick a value for ``qitem.answer_slot`` from the fact's retrieval.
+
+    Strategy: prefer the bare title of the highest-scored direct support,
+    fall back to a named entity from its sentence. Returns ``None`` if no
+    confident binding can be made — in that case downstream facts simply
+    see the unresolved variable, as before the patch.
+    """
+    slot = qitem.get("answer_slot")
+    if not isinstance(slot, str) or not slot.startswith("?"):
+        return None
+    if slot in current_bindings and not _is_placeholder_binding(current_bindings[slot]):
+        return None
+
+    forbidden = {v.lower() for v in current_bindings.values()
+                 if isinstance(v, str) and v and not _is_placeholder_binding(v)}
+    fact_surfaces = extract_from_fact_text(
+        qitem.get("fact_text", ""), qitem.get("constraint")
+    )
+    forbidden.update(s.lower() for s in fact_surfaces)
+
+    def _toks(s: str) -> set:
+        return set(re.findall(r"[a-z0-9]+", s.lower()))
+
+    forbidden_tok_sets = [_toks(f) for f in forbidden if f]
+
+    def _is_forbidden(value: str) -> bool:
+        vl = value.lower()
+        for f in forbidden:
+            if not f or not vl:
+                continue
+            if vl == f or (len(f) >= 3 and len(vl) >= 3 and (vl in f or f in vl)):
+                return True
+        # Token-overlap: catch reorderings like "Iqbal Ahmed Aamer" against
+        # forbidden "Aamer Iqbal". If ≥ half the candidate's content tokens
+        # appear in any forbidden surface, treat as forbidden.
+        v_toks = _toks(value)
+        if not v_toks:
+            return True
+        for fs in forbidden_tok_sets:
+            if not fs:
+                continue
+            shared = v_toks & fs
+            if shared and len(shared) * 2 >= len(v_toks):
+                return True
+        return False
+
+    def _looks_like_entity_seed(value: str) -> bool:
+        toks = value.split()
+        if not toks or toks[0].lower() in _BAD_LEADERS:
+            return False
+        return True
+
+    pool = list(fact_result.direct_supports) or list(fact_result.candidates[:5])
+    if not pool:
+        return None
+
+    def _looks_like_entity(value: str) -> bool:
+        """Multi-token proper-noun phrase, not a bare demonym or stop-word."""
+        if not value or len(value) < 3:
+            return False
+        toks = value.split()
+        if len(toks) < 2:
+            return False
+        if not _looks_like_entity_seed(value):
+            return False
+        return True
+
+    # Strategy 1: multi-token entities mentioned in the top direct-support
+    # text. This is the right choice for facts like ``X is named after ?slot``
+    # where the doc topic is the fact subject (X) and the answer lives in
+    # the sentence body.
+    for cand in pool[:3]:
+        if cand.get("composite_score", 0.0) < min_composite:
+            continue
+        for ent in cand.get("entities", []) or []:
+            if not isinstance(ent, str):
+                continue
+            if not _looks_like_entity(ent):
+                continue
+            if _is_forbidden(ent):
+                continue
+            return (slot, ent)
+
+    # Strategy 2: bare title (preferred when the answer entity has its own
+    # wiki article, e.g. a stadium / team page).
+    for cand in pool[:3]:
+        if cand.get("composite_score", 0.0) < min_composite:
+            continue
+        title = cand.get("title", "") or ""
+        bare = _title_bare(title) or title
+        if not _looks_like_entity(bare):
+            continue
+        if _is_forbidden(bare):
+            continue
+        return (slot, bare)
+
+    return None
+
+
+def _candidates_for_llm(
+    fact_result: "FactRetrieval",
+    *,
+    top_k: int = 5,
+) -> List[dict]:
+    """Pick the top-K candidates to show the LLM for binding verification.
+
+    Prefers direct_supports; falls back to bridge_supports; finally any
+    candidate. Dedupes by ``sid``. Returns lightweight dicts containing
+    just the fields the LLM prompt needs.
+    """
+    pool: List[dict] = []
+    seen: set = set()
+    for src in (fact_result.direct_supports,
+                fact_result.bridge_supports,
+                fact_result.candidates):
+        for c in src or []:
+            sid = c.get("sid")
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            pool.append({
+                "sid": sid,
+                "title": c.get("title", ""),
+                "text": (c.get("text") or "").strip(),
+                "composite_score": c.get("composite_score", 0.0),
+            })
+            if len(pool) >= top_k:
+                return pool
+    return pool
+
+
+def _bm25_followup_for_var(
+    *,
+    searcher: BM25Searcher,
+    pending_facts: Sequence[dict],
+    bindings: Dict[str, str],
+    var: str,
+    seen_titles: set,
+    docs: List[Tuple[str, str, List[str]]],
+    claim_kw: str,
+    k_per_fact: int = 6,
+    max_new_per_fact: int = 4,
+) -> int:
+    """Second-round BM25: for every not-yet-processed fact that mentions ``var``,
+    re-issue BM25 with the now-bound query. Returns number of new docs added."""
+    if not pending_facts:
+        return 0
+    added = 0
+    for q in pending_facts:
+        fact_text = q.get("fact_text", "") or ""
+        if var not in fact_text:
+            continue
+        query = _fact_search_text(q, bindings)
+        if not query:
+            continue
+        if claim_kw:
+            query = f"{query} {claim_kw}"
+        new_for_this_fact = 0
+        for title, _score, contents in searcher.search(query, k=k_per_fact):
+            if title in seen_titles:
+                continue
+            seen_titles.add(title)
+            docs.append((title, contents, ["bound_followup"]))
+            added += 1
+            new_for_this_fact += 1
+            if new_for_this_fact >= max_new_per_fact:
+                break
+    return added
+
+
 # ---------------------------------------------------------------------------- top level
 @dataclass
 class RetrievalConfig:
@@ -540,6 +862,19 @@ class RetrievalConfig:
     # may grow them based on fact count / criticality.
     final_max_sentences: int = 12
     final_max_docs: int = 6
+    # ---- LLM-assisted binding (Option C) ----
+    # If the caller passes an ``llm_binding_fn`` into ``retrieve_for_claim``,
+    # the heuristic ``_extract_binding`` is replaced by the LLM closure. To
+    # bound cost we only invoke it on ``critical`` facts by default. Set
+    # ``llm_binding_all_facts=True`` to call it on every fact with an
+    # ``answer_slot``.
+    llm_binding_all_facts: bool = False
+    # When True, if the LLM returns ``None``, we DO NOT fall back to the
+    # heuristic. This keeps the binding quality bar high (the heuristic
+    # was net-negative end-to-end at 200 claims).
+    llm_binding_no_heuristic_fallback: bool = True
+    # How many candidates to show the LLM.
+    llm_binding_top_k: int = 5
 
 
 def retrieve_for_claim(
@@ -550,6 +885,7 @@ def retrieve_for_claim(
     encoder: SentenceEncoder,
     config: RetrievalConfig | None = None,
     initial_bindings: Optional[Dict[str, str]] = None,
+    llm_binding_fn: Optional[LLMBindingFn] = None,
 ) -> Dict[str, object]:
     """Run the full GraphRAG retrieval for one claim.
 
@@ -589,6 +925,7 @@ def retrieve_for_claim(
         }
 
     # 2) graph construction -------------------------------------------------
+    seen_titles = {t for t, _, _ in docs}
     graph = build_hetero_graph(
         [(t, c) for t, c, _ in docs],
         encoder=encoder,
@@ -597,9 +934,26 @@ def retrieve_for_claim(
     )
 
     # 3) per-fact retrieval in topological order ----------------------------
+    # S1: after each fact resolves, write back the bound entity for its
+    # ``answer_slot`` and re-issue BM25 for any downstream fact that mentions
+    # the freshly-bound variable. The graph is rebuilt lazily only when new
+    # docs actually arrive (otherwise we keep the cached graph).
     fact_results: Dict[str, FactRetrieval] = {}
     ordered = _topological_order(question_items)
-    for qitem in ordered:
+    claim_kw = _claim_keywords(claim)
+    graph_dirty = False
+    binding_trace: List[Dict[str, str]] = []
+    followup_added_total = 0
+    for i, qitem in enumerate(ordered):
+        if graph_dirty:
+            graph = build_hetero_graph(
+                [(t, c) for t, c, _ in docs],
+                encoder=encoder,
+                sem_top_k=config.sem_top_k,
+                sem_threshold=config.sem_threshold,
+            )
+            graph_dirty = False
+
         result = _retrieve_for_fact(
             qitem=qitem,
             graph=graph,
@@ -610,6 +964,60 @@ def retrieve_for_claim(
             top_k_final=config.fact_top_k_final,
         )
         fact_results[result.fact_id] = result
+
+        # ---- pick a binding for this fact's answer_slot ------------------
+        # When ``llm_binding_fn`` is set, hand the top candidates to the LLM
+        # to choose the bound entity (Option C). Otherwise fall back to the
+        # cheap heuristic ``_extract_binding`` (which was net-negative on
+        # 200 claims). The LLM call is gated on ``critical`` by default to
+        # keep cost bounded.
+        new_binding: Optional[Tuple[str, str]] = None
+        binding_source = ""
+        slot = qitem.get("answer_slot")
+        if (
+            llm_binding_fn is not None
+            and isinstance(slot, str)
+            and slot.startswith("?")
+            and (config.llm_binding_all_facts or qitem.get("critical"))
+        ):
+            top_cands = _candidates_for_llm(result, top_k=config.llm_binding_top_k)
+            if top_cands:
+                try:
+                    new_binding = llm_binding_fn(qitem, top_cands, bindings)
+                    binding_source = "llm" if new_binding else "llm_null"
+                except Exception as exc:
+                    new_binding = None
+                    binding_source = f"llm_error:{type(exc).__name__}"
+            if new_binding is None and not config.llm_binding_no_heuristic_fallback:
+                new_binding = _extract_binding(qitem, result, bindings)
+                if new_binding is not None:
+                    binding_source = "heuristic_fallback"
+        else:
+            new_binding = _extract_binding(qitem, result, bindings)
+            if new_binding is not None:
+                binding_source = "heuristic"
+
+        if new_binding is None:
+            continue
+        var, value = new_binding
+        bindings[var] = value
+        binding_trace.append({"fact_id": qitem.get("fact_id", ""),
+                              "var": var, "value": value,
+                              "source": binding_source})
+        pending = ordered[i + 1:]
+        added = _bm25_followup_for_var(
+            searcher=searcher,
+            pending_facts=pending,
+            bindings=bindings,
+            var=var,
+            seen_titles=seen_titles,
+            docs=docs,
+            claim_kw=claim_kw,
+            k_per_fact=config.k_fact,
+        )
+        if added > 0:
+            followup_added_total += added
+            graph_dirty = True
 
     # 4) assembly -----------------------------------------------------------
     from .assembly import assemble_evidence
@@ -630,6 +1038,9 @@ def retrieve_for_claim(
             "num_sentences": len(graph.sentences),
             "num_entities": len(graph.entity_keys),
             "num_communities": len(set(graph.communities.values())),
+            "followup_docs_added": followup_added_total,
+            "binding_trace": binding_trace,
+            "final_bindings": dict(bindings),
         },
         "fact_results": [_fact_to_dict(r) for r in fact_results.values()],
         "selected_sentences": assembly["selected"],

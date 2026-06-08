@@ -10,3 +10,4 @@ scripts/llm
 .codex
 scripts/run_scripts
 documents
+logs

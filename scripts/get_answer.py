@@ -61,6 +61,18 @@ def build_client_and_model(plan, port='8370'):
         return client, "DeepSeek-V3.2", None, {}, 2048, 0.7
     
     if plan.startswith("bit_plan"):
+        # ``LLM_FALLBACK=aiping`` routes bit_plan runs to the public aiping.cn
+        # DeepSeek endpoint when the BIT MaaS gateway is unreachable (e.g.,
+        # off-VPN). Same model name (DeepSeek-V3.2), so downstream prompts and
+        # output schema stay compatible.
+        if os.getenv("LLM_FALLBACK", "").lower() == "aiping":
+            api_key = os.getenv("AIPING_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    "LLM_FALLBACK=aiping but AIPING_API_KEY is not set.")
+            client = OpenAI(api_key=api_key,
+                            base_url="https://www.aiping.cn/api/v1")
+            return client, "DeepSeek-V3.2", None, {}, 8192, 0.7
         api_key = os.getenv("BIT_API_KEY")
         if not api_key:
             raise ValueError("BIT_API_KEY is not set in environment variables.")

@@ -24,16 +24,175 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
-from typing import Dict, List
+from typing import Callable, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
 from graph_rag.bm25_index import BM25Searcher, build_index, DEFAULT_INDEX_PATH
 from graph_rag.encoder import SentenceEncoder, get_encoder
-from graph_rag.retriever import RetrievalConfig, retrieve_for_claim
+from graph_rag.retriever import (
+    RetrievalConfig,
+    _is_placeholder_binding,
+    retrieve_for_claim,
+)
+
+
+# --------------------------------------------------------------------------- LLM-assisted binding
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+def _build_llm_client(plan: str):
+    """Build an OpenAI-compatible client + model name from ``plan`` prefix.
+
+    Mirrors the logic in ``scripts/get_answer.py:build_client_and_model`` but
+    only returns the LLM call surface needed for binding verification (no
+    system prompt, no extra_body). Honors the ``LLM_FALLBACK=aiping`` env
+    override so the same code works on/off BIT VPN.
+    """
+    from openai import OpenAI
+
+    plan = (plan or "").lower()
+    fallback = os.getenv("LLM_FALLBACK", "").lower() == "aiping"
+
+    if plan.startswith("azure"):
+        return OpenAI(
+            api_key=os.environ["AZURE_OPENAI_API_KEY"],
+            base_url="https://open1027.openai.azure.com/openai/v1/",
+        ), "gpt-4o"
+    if plan.startswith("qc_plan") or fallback or plan.startswith("qwen_plan"):
+        return OpenAI(
+            api_key=os.environ["AIPING_API_KEY"],
+            base_url="https://www.aiping.cn/api/v1",
+        ), "DeepSeek-V3.2"
+    if plan.startswith("bit_plan"):
+        return OpenAI(
+            api_key=os.environ["BIT_API_KEY"],
+            base_url="https://maas.bit.edu.cn/v1",
+        ), "DeepSeek-V3.2"
+    # default: try BIT
+    return OpenAI(
+        api_key=os.environ["BIT_API_KEY"],
+        base_url="https://maas.bit.edu.cn/v1",
+    ), "DeepSeek-V3.2"
+
+
+def _format_constraint(qitem: dict) -> str:
+    cons = qitem.get("constraint") or {}
+    bits: List[str] = []
+    for slot_name in ("time", "exact_name", "location", "title_role",
+                       "unique_modifier", "quantity", "comparison"):
+        for v in cons.get(slot_name, []) or []:
+            if isinstance(v, str) and v.strip() and not v.startswith("?"):
+                bits.append(f"{slot_name}={v}")
+    if cons.get("negation"):
+        bits.append(f"negation={cons['negation']}")
+    return "; ".join(bits) if bits else "(none)"
+
+
+def _format_fact_with_bindings(fact_text: str, bindings: Dict[str, str]) -> str:
+    """Substitute resolved (non-placeholder) bindings into the fact text."""
+    out = fact_text or ""
+    for var, val in bindings.items():
+        if not val or _is_placeholder_binding(val):
+            continue
+        out = out.replace(var, val)
+    return out
+
+
+def make_llm_binding_fn(plan: str, max_retries: int = 2, debug: bool = False):
+    """Return a closure ``(qitem, top_candidates, bindings) -> Optional[(slot, value)]``.
+
+    The closure asks the LLM to identify which named entity the fact's
+    ``answer_slot`` refers to, given the top retrieval candidates. It
+    returns ``None`` when the LLM is not confident, so the caller can
+    refuse to write a noisy binding.
+    """
+    client, model = _build_llm_client(plan)
+
+    def _fn(qitem: dict, top_cands: List[dict],
+            bindings: Dict[str, str]) -> Optional[Tuple[str, str]]:
+        slot = qitem.get("answer_slot")
+        if not isinstance(slot, str) or not slot.startswith("?"):
+            return None
+        if not top_cands:
+            return None
+
+        fact_text = _format_fact_with_bindings(
+            qitem.get("fact_text", ""), bindings)
+        constraint_str = _format_constraint(qitem)
+        cand_lines = []
+        for i, c in enumerate(top_cands[:5], 1):
+            title = c.get("title", "")
+            text = (c.get("text") or "").strip().replace("\n", " ")
+            if len(text) > 350:
+                text = text[:350] + "..."
+            cand_lines.append(f"[{i}] (from \"{title}\") {text}")
+        cand_block = "\n".join(cand_lines)
+
+        prompt = (
+            "You are resolving a variable in an atomic fact during fact verification.\n"
+            "Pick the named entity that the variable should bind to, based on the "
+            "evidence sentences below.\n\n"
+            f"Fact statement: {fact_text}\n"
+            f"Constraints on the answer: {constraint_str}\n"
+            f"Variable to bind: {slot}\n\n"
+            "Evidence sentences (top retrieval candidates):\n"
+            f"{cand_block}\n\n"
+            "Rules:\n"
+            f"- \"value\" must be the bare Wikipedia-style entity name for {slot} "
+            "(e.g. \"Karl Kraepelin\", \"Karachi Blues\", \"Iqbal Stadium\").\n"
+            "- Do NOT use descriptions like \"a German naturalist\" — give the actual name.\n"
+            "- If no sentence above unambiguously supports a value, return value=null.\n"
+            "- \"evidence_idx\" is the [N] index supporting your pick (0 if value is null).\n\n"
+            "Respond with ONLY a JSON object on one line, no markdown fences, no commentary:\n"
+            "{\"value\": \"<entity name or null>\", \"evidence_idx\": <integer>}"
+        )
+
+        last_err = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=128,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                content = _JSON_FENCE_RE.sub("", content).strip()
+                # find first { ... } if there's noise
+                m = re.search(r"\{[^{}]*\}", content)
+                if m:
+                    content = m.group(0)
+                parsed = json.loads(content)
+                value = parsed.get("value")
+                if not isinstance(value, str):
+                    return None
+                value = value.strip()
+                if not value or value.lower() in {"null", "none", "n/a", "nil"}:
+                    if debug:
+                        print(f"[llm_binding] {qitem.get('fact_id')} {slot}: null",
+                              flush=True)
+                    return None
+                if debug:
+                    print(f"[llm_binding] {qitem.get('fact_id')} {slot} = {value}",
+                          flush=True)
+                return (slot, value)
+            except Exception as exc:
+                last_err = exc
+                if attempt < max_retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                if debug:
+                    print(f"[llm_binding] error {qitem.get('fact_id')}: "
+                          f"{type(exc).__name__}: {exc}", flush=True)
+                return None
+        return None
+
+    return _fn
 
 
 def _extract_initial_bindings(decomposition: dict) -> Dict[str, str]:
@@ -53,6 +212,7 @@ def process_one(
     searcher: BM25Searcher,
     encoder: SentenceEncoder,
     config: RetrievalConfig,
+    llm_binding_fn: Optional[Callable] = None,
 ) -> dict:
     claim = item.get("claim", "")
     question_plan = item.get("question_plan") or {}
@@ -68,6 +228,7 @@ def process_one(
             encoder=encoder,
             config=config,
             initial_bindings=initial_bindings,
+            llm_binding_fn=llm_binding_fn,
         )
     except Exception as exc:  # pragma: no cover - defensive
         result = {
@@ -173,9 +334,22 @@ def main(args):
         fact_top_k_final=args.fact_top_k_final,
         final_max_sentences=args.final_max_sentences,
         final_max_docs=args.final_max_docs,
+        llm_binding_all_facts=bool(args.llm_binding_all_facts),
+        llm_binding_no_heuristic_fallback=bool(
+            args.llm_binding_no_heuristic_fallback),
+        llm_binding_top_k=args.llm_binding_top_k,
     )
 
-    fn = partial(process_one, searcher=searcher, encoder=encoder, config=config)
+    llm_binding_fn = None
+    if args.use_llm_binding:
+        print(f"[retrieve_evidence] enabling LLM-assisted binding "
+              f"(all_facts={config.llm_binding_all_facts}, "
+              f"top_k={config.llm_binding_top_k})", flush=True)
+        llm_binding_fn = make_llm_binding_fn(
+            plan=args.plan, debug=bool(args.llm_binding_debug))
+
+    fn = partial(process_one, searcher=searcher, encoder=encoder, config=config,
+                 llm_binding_fn=llm_binding_fn)
 
     results: List[dict] = []
     start_time = time.time()
@@ -258,4 +432,20 @@ if __name__ == "__main__":
     parser.add_argument("--final_max_docs", type=int, default=4)
     parser.add_argument("--log_every", type=int, default=10,
                         help="Print a progress line every N processed claims.")
+
+    # LLM-assisted binding (Option C)
+    parser.add_argument("--use_llm_binding", action="store_true",
+                        help="Use an LLM to verify/select the answer-slot "
+                             "binding instead of the heuristic.")
+    parser.add_argument("--llm_binding_all_facts", action="store_true",
+                        help="Call the LLM on every fact (default: critical only).")
+    parser.add_argument("--llm_binding_no_heuristic_fallback",
+                        action="store_true", default=True,
+                        help="Skip the heuristic fallback when the LLM returns "
+                             "null (default: True).")
+    parser.add_argument("--llm_binding_top_k", type=int, default=5,
+                        help="Number of top candidate sentences passed to the LLM.")
+    parser.add_argument("--llm_binding_debug", action="store_true",
+                        help="Verbose logging of every LLM binding decision.")
+
     main(parser.parse_args())
