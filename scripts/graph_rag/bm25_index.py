@@ -121,6 +121,33 @@ class BM25Searcher:
             out.append((title_field, float(score), contents_field))
         return out
 
+    # ------------------------------------------------------------ title-only
+    def search_title(self, query: str, k: int = 5) -> List[Tuple[str, float, str]]:
+        """BM25 against the ``title`` field only.
+
+        For multi-hop fact checking, the answer-entity page almost always has
+        a Wikipedia title that literally names the target entity. Issuing a
+        title-only BM25 for each fact's ``target_surfaces`` / ``exact_name``
+        gives those anchor pages a strong, high-precision entry into the
+        candidate pool even when their body text has weak overlap with the
+        claim. Used by the role-aware gather stage in ``retriever`` to back
+        up the broader ``[title, contents]`` sweep.
+        """
+        q = _sanitize_query(query or "")
+        if not q:
+            return []
+        try:
+            parsed = self.index.parse_query(q, ["title"])
+        except Exception:
+            return []
+        out = []
+        for score, addr in self.searcher.search(parsed, limit=k).hits:
+            doc = self.searcher.doc(addr)
+            title_field = doc.get_first("title") or ""
+            contents_field = doc.get_first("contents") or ""
+            out.append((title_field, float(score), contents_field))
+        return out
+
     # ------------------------------------------------------------- multi-query
     def multi_search(
         self,

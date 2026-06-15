@@ -34,6 +34,7 @@ from tqdm import tqdm
 
 from graph_rag.bm25_index import BM25Searcher, build_index, DEFAULT_INDEX_PATH
 from graph_rag.encoder import SentenceEncoder, get_encoder
+from graph_rag.reranker import CrossEncoderReranker, get_reranker
 from graph_rag.retriever import (
     RetrievalConfig,
     _is_placeholder_binding,
@@ -213,6 +214,7 @@ def process_one(
     encoder: SentenceEncoder,
     config: RetrievalConfig,
     llm_binding_fn: Optional[Callable] = None,
+    reranker: Optional[CrossEncoderReranker] = None,
 ) -> dict:
     claim = item.get("claim", "")
     question_plan = item.get("question_plan") or {}
@@ -229,6 +231,8 @@ def process_one(
             config=config,
             initial_bindings=initial_bindings,
             llm_binding_fn=llm_binding_fn,
+            num_hops=item.get("num_hops"),
+            reranker=reranker,
         )
     except Exception as exc:  # pragma: no cover - defensive
         result = {
@@ -338,7 +342,43 @@ def main(args):
         llm_binding_no_heuristic_fallback=bool(
             args.llm_binding_no_heuristic_fallback),
         llm_binding_top_k=args.llm_binding_top_k,
+        min_hops_for_binding=args.min_hops_for_binding,
+        require_rely_on_for_binding=not args.no_require_rely_on,
+        # Option B
+        enable_title_anchor=not args.no_title_anchor,
+        k_title_anchor=args.k_title_anchor,
+        title_anchor_boost=args.title_anchor_boost,
+        # Option E
+        chain_depth_for_boost=args.chain_depth_for_boost,
+        chain_boost_factor=args.chain_boost_factor,
+        max_docs_per_extra_hop=args.max_docs_per_extra_hop,
+        # Option A
+        enable_soft_expand=not args.no_soft_expand,
+        soft_expand_k_query=args.soft_expand_k_query,
+        soft_expand_max_new=args.soft_expand_max_new,
+        # Option C
+        reranker_blend=args.reranker_blend,
+        reranker_max_candidates=args.reranker_max_candidates,
+        direct_support_offset=args.direct_support_offset,
     )
+
+    # Option C: load the cross-encoder reranker (lazy — no-op if disabled).
+    reranker = None
+    if args.reranker_path:
+        print(f"[retrieve_evidence] loading reranker {args.reranker_path} "
+              f"(device={args.reranker_device or 'auto'}, "
+              f"batch={args.reranker_batch_size}, fp16={not args.reranker_fp32})",
+              flush=True)
+        reranker = get_reranker(
+            model_path=args.reranker_path,
+            device=args.reranker_device or None,
+            batch_size=args.reranker_batch_size,
+            max_length=args.reranker_max_length,
+            use_fp16=not args.reranker_fp32,
+        )
+        if reranker is None:
+            print("[retrieve_evidence] reranker load failed — falling back to "
+                  "heuristic-only scoring", flush=True)
 
     llm_binding_fn = None
     if args.use_llm_binding:
@@ -349,7 +389,7 @@ def main(args):
             plan=args.plan, debug=bool(args.llm_binding_debug))
 
     fn = partial(process_one, searcher=searcher, encoder=encoder, config=config,
-                 llm_binding_fn=llm_binding_fn)
+                 llm_binding_fn=llm_binding_fn, reranker=reranker)
 
     results: List[dict] = []
     start_time = time.time()
@@ -447,5 +487,67 @@ if __name__ == "__main__":
                         help="Number of top candidate sentences passed to the LLM.")
     parser.add_argument("--llm_binding_debug", action="store_true",
                         help="Verbose logging of every LLM binding decision.")
+
+    # Options D + E (binding): gate binding by claim/fact structure
+    parser.add_argument("--min_hops_for_binding", type=int, default=3,
+                        help="(Option D) Disable binding propagation for "
+                             "claims with num_hops below this. Set to 0 to "
+                             "disable the gate. Default 3.")
+    parser.add_argument("--no_require_rely_on", action="store_true",
+                        help="(Inverse of Option E binding) Allow binding on "
+                             "root facts that have no rely_on. Default off — "
+                             "root facts skip binding.")
+
+    # Option B: title-only anchor channel
+    parser.add_argument("--no_title_anchor", action="store_true",
+                        help="(Option B) Disable the title-only BM25 channel.")
+    parser.add_argument("--k_title_anchor", type=int, default=3,
+                        help="(Option B) top-k for each title-only query.")
+    parser.add_argument("--title_anchor_boost", type=float, default=1.5,
+                        help="(Option B) score multiplier for title-anchor hits.")
+
+    # Option E (recall): dynamic budgets
+    parser.add_argument("--chain_depth_for_boost", type=int, default=2,
+                        help="(Option E) facts with rely_on chain depth >= "
+                             "this value get k_fact * chain_boost_factor.")
+    parser.add_argument("--chain_boost_factor", type=float, default=1.5,
+                        help="(Option E) k_fact / k_critical multiplier for "
+                             "deep-chain facts.")
+    parser.add_argument("--max_docs_per_extra_hop", type=int, default=10,
+                        help="(Option E) extra max_docs budget per num_hops "
+                             "above 2. Set 0 to disable.")
+
+    # Option A: forced soft expansion
+    parser.add_argument("--no_soft_expand", action="store_true",
+                        help="(Option A) Disable the parent-augmented BM25 "
+                             "pre-pass that runs before per-fact retrieval.")
+    parser.add_argument("--soft_expand_k_query", type=int, default=6,
+                        help="(Option A) top-k for the augmented BM25 query.")
+    parser.add_argument("--soft_expand_max_new", type=int, default=5,
+                        help="(Option A) max new docs added per soft expand.")
+
+    # Option C: cross-encoder reranker
+    parser.add_argument("--reranker_path", type=str, default="",
+                        help="(Option C) path to a cross-encoder model. Pass "
+                             "/mnt/data/hezhisheng/models/bge-reranker-v2-m3 "
+                             "to enable. Empty string disables reranking.")
+    parser.add_argument("--reranker_device", type=str, default="",
+                        help="(Option C) cuda / cpu. Empty = auto-detect.")
+    parser.add_argument("--reranker_batch_size", type=int, default=64,
+                        help="(Option C) reranker batch size per fact.")
+    parser.add_argument("--reranker_max_length", type=int, default=256,
+                        help="(Option C) max token length per (q,p) pair.")
+    parser.add_argument("--reranker_fp32", action="store_true",
+                        help="(Option C) disable fp16 (CPU or debugging).")
+    parser.add_argument("--reranker_blend", type=float, default=0.5,
+                        help="(Option C) weight of reranker score in ce_score. "
+                             "0.0 = ignore reranker, 1.0 = pure reranker.")
+    parser.add_argument("--reranker_max_candidates", type=int, default=60,
+                        help="(Option C) max candidates per fact sent to GPU.")
+    parser.add_argument("--direct_support_offset", type=float, default=0.0,
+                        help="(Option C.1) Constant added to every ce_score "
+                             "threshold in _direct_support_pass. Use ~0.10 "
+                             "when reranker is enabled to match its higher "
+                             "ce_score mean. 0.0 = legacy gate.")
 
     main(parser.parse_args())

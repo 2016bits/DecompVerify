@@ -49,6 +49,7 @@ from .encoder import SentenceEncoder
 from .entity_extract import extract_from_fact_text, extract_from_sentence
 from .graph_build import HeteroGraph, build_hetero_graph
 from .ppr import personalised_pagerank
+from .reranker import CrossEncoderReranker
 
 
 VAR_PATTERN = re.compile(r"\?[A-Za-z_][A-Za-z0-9_]*")
@@ -123,6 +124,83 @@ def _is_constraint_anchor(title: str, qitem: dict) -> bool:
                     return True
     return False
 
+
+
+def _fact_chain_depths(question_items: Sequence[dict]) -> Dict[str, int]:
+    """Return fact_id -> longest ``rely_on`` chain depth.
+
+    Root facts (no ``rely_on``) have depth 0. A leaf at the end of a
+    ``f1 -> f2 -> f3`` chain has depth 2. Used by Option E to give
+    deep-chain facts a larger BM25 budget (their target docs are the
+    ones most likely to never enter the candidate pool).
+    """
+    by_id = {q.get("fact_id"): q for q in question_items if q.get("fact_id")}
+    cache: Dict[str, int] = {}
+
+    def _d(fid: str, stack: set) -> int:
+        if fid in cache:
+            return cache[fid]
+        if fid in stack:  # cycle guard
+            return 0
+        q = by_id.get(fid)
+        if q is None:
+            cache[fid] = 0
+            return 0
+        parents = [p for p in (q.get("rely_on") or []) if p in by_id]
+        if not parents:
+            cache[fid] = 0
+            return 0
+        stack.add(fid)
+        d = 1 + max(_d(p, stack) for p in parents)
+        stack.discard(fid)
+        cache[fid] = d
+        return d
+
+    for fid in by_id:
+        _d(fid, set())
+    return cache
+
+
+def _fact_anchor_surfaces(qitem: dict) -> List[str]:
+    """Pick the surface forms that should drive the title-only sweep.
+
+    For each fact we want to hit any wiki page whose title literally names
+    one of the fact's target entities. The set of "good" surfaces is:
+
+    * proper-noun phrases extracted from the fact text;
+    * ``constraint.exact_name`` strings;
+    * ``constraint.location`` / ``title_role`` strings — these are usually
+      the second hop of a chain (\"<X> is a stadium in Faisalabad\"); a
+      title-only hit on the location won't hurt and occasionally lands
+      the answer doc directly.
+
+    We drop short / unsafe items (< 3 chars, slot placeholders, single
+    stop-words) — they would just turn the title sweep into noise.
+    """
+    seen: set = set()
+    out: List[str] = []
+
+    def _push(s: str) -> None:
+        if not isinstance(s, str):
+            return
+        s = s.strip().strip(".,;:")
+        if not s or s.startswith("?") or len(s) < 3:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(s)
+
+    for surface in extract_from_fact_text(
+        qitem.get("fact_text", ""), qitem.get("constraint")
+    ):
+        _push(surface)
+    cons = qitem.get("constraint") or {}
+    for slot in ("exact_name", "location", "title_role", "unique_modifier"):
+        for v in cons.get(slot, []) or []:
+            _push(v)
+    return out
 
 
 def _topological_order(question_items: Sequence[dict]) -> List[dict]:
@@ -211,9 +289,31 @@ def _gather_candidate_docs(
     k_critical: int = 8,
     k_constraint: int = 4,
     max_docs: int = 30,
+    # ---- Option E: per-fact dynamic budget ----
+    chain_depths: Optional[Dict[str, int]] = None,
+    chain_depth_for_boost: int = 2,
+    chain_boost_factor: float = 1.5,
+    # ---- Option B: title-anchor channel ----
+    k_title_anchor: int = 3,
+    title_anchor_boost: float = 1.5,
+    enable_title_anchor: bool = True,
 ) -> List[Tuple[str, str, List[str]]]:
-    """Role-aware quota gather. Returns ``(title, contents, role_tags)``."""
+    """Role-aware quota gather. Returns ``(title, contents, role_tags)``.
+
+    Options enabled in this revision:
+
+    * **B – title-anchor sweep.** For every fact we collect ``exact_name``
+      and proper-noun surfaces from its text/constraint and issue a
+      title-only BM25 against them. Title-only matches are scored with a
+      ``title_anchor_boost`` so the answer-entity wiki page (which usually
+      has weak content overlap with the claim) wins a seat in the pool.
+    * **E – chain-depth boost.** Facts whose ``rely_on`` chain depth is at
+      least ``chain_depth_for_boost`` get ``k_fact * chain_boost_factor``
+      slots in their fact-level BM25 query — they are the ones whose answer
+      docs are most likely to miss the pool entirely.
+    """
     pool: Dict[str, Dict] = {}
+    chain_depths = chain_depths or {}
 
     def _push(title: str, contents: str, score: float, role: str) -> None:
         slot = pool.setdefault(
@@ -233,7 +333,11 @@ def _gather_candidate_docs(
     claim_kw = _claim_keywords(claim)
     for qitem in question_items:
         is_critical = bool(qitem.get("critical"))
-        k = k_critical if is_critical else k_fact
+        # Option E: deep-chain facts get a larger budget.
+        depth = chain_depths.get(qitem.get("fact_id"), 0)
+        boost_k = (depth >= chain_depth_for_boost)
+        base_k = k_critical if is_critical else k_fact
+        k = int(round(base_k * chain_boost_factor)) if boost_k else base_k
         fact_only = _fact_search_text(qitem, bindings={})
         # Pair the fact with the claim's keywords so deep-chain facts
         # whose own text is short / variable-heavy still pull topical
@@ -243,7 +347,8 @@ def _gather_candidate_docs(
             searcher.search(query, k=k)
         ):
             bonus = 1.2 if is_critical else 1.0
-            _push(title, contents, bonus * score / (1 + 0.05 * rank), "fact")
+            _push(title, contents, bonus * score / (1 + 0.05 * rank),
+                  "fact_deep" if boost_k else "fact")
         # Also issue each ``search_hint`` as a focused query – BM25 is
         # noisier on long concatenated queries (the hints get drowned
         # out by claim tokens). Treating each hint as a separate query
@@ -264,6 +369,20 @@ def _gather_candidate_docs(
             ):
                 _push(title, contents, 0.8 * score / (1 + 0.05 * rank),
                       "constraint")
+
+        # ---- Option B: title-anchor sweep -------------------------------
+        # For each fact, issue title-only BM25 against its anchor surfaces.
+        # We dedupe surfaces across facts to keep the title sweep cheap
+        # for multi-fact claims; the score already encodes which fact
+        # contributed via the title_anchor role.
+        if enable_title_anchor and hasattr(searcher, "search_title"):
+            for surface in _fact_anchor_surfaces(qitem):
+                for rank, (title, score, contents) in enumerate(
+                    searcher.search_title(surface, k=k_title_anchor)
+                ):
+                    _push(title, contents,
+                          title_anchor_boost * score / (1 + 0.05 * rank),
+                          "title_anchor")
 
     ranked = sorted(pool.items(), key=lambda kv: -kv[1]["score"])
     out: List[Tuple[str, str, List[str]]] = []
@@ -409,6 +528,8 @@ def _direct_support_pass(
     entity_score: float,
     constraint_score: float,
     has_target_entity: bool,
+    *,
+    offset: float = 0.0,
 ) -> bool:
     """Loose direct-support gate (lessons from plan4.4/4.5 and v1 audit).
 
@@ -417,16 +538,23 @@ def _direct_support_pass(
     parent), so a hard ``entity_score >= 0.5`` rule excludes too much.
     The new gates lower thresholds and lean on ``has_target_entity``
     or the semantic CE score.
+
+    ``offset`` shifts all 5 ``ce_score`` thresholds by the same constant.
+    Use a positive offset (~0.10) when the cross-encoder reranker is
+    blended into ``ce_score`` — the reranker bumps the mean ce_score
+    from ~0.51 to ~0.64 in our 200-claim benchmark, so the legacy gate
+    admits too many marginal sentences and pollutes ``evidence_per_fact``.
+    Default 0.0 keeps the legacy heuristic-only behaviour unchanged.
     """
-    if ce_score < 0.20:
+    if ce_score < 0.20 + offset:
         return False
-    if has_target_entity and ce_score >= 0.30:
+    if has_target_entity and ce_score >= 0.30 + offset:
         return True
-    if entity_score >= 0.34 and ce_score >= 0.28:
+    if entity_score >= 0.34 and ce_score >= 0.28 + offset:
         return True
-    if constraint_score >= 0.5 and ce_score >= 0.32:
+    if constraint_score >= 0.5 and ce_score >= 0.32 + offset:
         return True
-    if ce_score >= 0.45:
+    if ce_score >= 0.45 + offset:
         return True
     return False
 
@@ -468,6 +596,10 @@ def _retrieve_for_fact(
     *,
     top_k_candidates: int = 25,
     top_k_final: int = 5,
+    reranker: Optional[CrossEncoderReranker] = None,
+    reranker_blend: float = 0.5,
+    reranker_max_candidates: int = 60,
+    direct_support_offset: float = 0.0,
 ) -> FactRetrieval:
     seeds, summary = _build_seeds(
         graph, qitem, encoder=encoder, parent_results=parent_results,
@@ -532,6 +664,44 @@ def _retrieve_for_fact(
             if _constraint_year_conflict(title, qitem):
                 conflict_sids.add(sid)
 
+    # Option C: batch cross-encoder rerank over the candidate set. We cap
+    # the number of pairs sent to the GPU per fact (``reranker_max_candidates``)
+    # to keep latency bounded even when a deep-chain claim pulls in 100+
+    # sentences. Candidates kept for reranking are those with the highest
+    # coarse signal (semantic + entity overlap + PPR) so the discriminative
+    # power of the reranker is spent where it matters.
+    reranker_scores: Dict[str, float] = {}
+    if reranker is not None and query and candidate_sids:
+        coarse_rank: List[Tuple[str, float]] = []
+        for sid in candidate_sids:
+            idx = graph.sid_to_idx.get(sid)
+            if idx is None:
+                continue
+            sent = graph.sentences[idx]
+            sem_pre = (
+                float(graph.sent_embeddings[idx] @ q_emb)
+                if q_emb is not None else 0.0
+            )
+            ent_pre = _entity_overlap_score(sent.text, target_surfaces)
+            sent_node = graph.sentence_node(sid)
+            ppr_pre = ppr_scores.get(sent_node, 0.0)
+            coarse_rank.append(
+                (sid, sem_pre + 0.5 * ent_pre + math.sqrt(max(ppr_pre, 0.0)))
+            )
+        coarse_rank.sort(key=lambda kv: -kv[1])
+        ranked_sids = [sid for sid, _ in coarse_rank[:reranker_max_candidates]]
+        pairs = []
+        for sid in ranked_sids:
+            idx = graph.sid_to_idx.get(sid)
+            if idx is None:
+                continue
+            pairs.append((query, graph.sentences[idx].text))
+        if pairs:
+            arr = reranker.score(pairs)
+            if arr.size == len(pairs):
+                for sid, sc in zip(ranked_sids, arr):
+                    reranker_scores[sid] = float(sc)
+
     candidates: List[dict] = []
     for sent in graph.sentences:
         sid = sent.sid
@@ -551,17 +721,39 @@ def _retrieve_for_fact(
 
         # ce_score is a soft surrogate – combination of semantic, surface
         # and PPR signals, normalised into [0, 1].
-        ce_score = 0.4 * sem_score + 0.4 * ent_score + 0.2 * cons_score
-        ce_score = max(0.0, min(1.0, ce_score))
+        ce_heur = 0.4 * sem_score + 0.4 * ent_score + 0.2 * cons_score
+        ce_heur = max(0.0, min(1.0, ce_heur))
         is_entity_anchor = sent.title in anchor_titles
         is_constraint_anchor = sent.title in constraint_anchor_titles
         is_anchor = is_entity_anchor or is_constraint_anchor
-        composite = (
-            0.33 * sem_score
-            + 0.30 * ent_score
-            + 0.18 * cons_score
-            + 0.19 * math.sqrt(max(ppr_mass, 0.0))
-        )
+
+        # Option C: blend the cross-encoder relevance probability in.
+        # When the reranker did not score this sid (sentence fell outside
+        # the per-fact rerank budget) we fall back to the pure-heuristic
+        # path. The blend weight ``reranker_blend`` controls how much
+        # of the cross-encoder signal flows into ``ce_score`` and the
+        # composite ranking: 0.5 means equal vote with the heuristic.
+        ce_rerank = reranker_scores.get(sid)
+        if ce_rerank is not None:
+            ce_score = (
+                reranker_blend * ce_rerank + (1 - reranker_blend) * ce_heur
+            )
+            ce_score = max(0.0, min(1.0, ce_score))
+            composite = (
+                0.25 * sem_score
+                + 0.25 * ent_score
+                + 0.15 * cons_score
+                + 0.15 * math.sqrt(max(ppr_mass, 0.0))
+                + 0.20 * ce_rerank
+            )
+        else:
+            ce_score = ce_heur
+            composite = (
+                0.33 * sem_score
+                + 0.30 * ent_score
+                + 0.18 * cons_score
+                + 0.19 * math.sqrt(max(ppr_mass, 0.0))
+            )
         # Doc anchoring: a sentence from a doc whose title literally names
         # one of the fact's target entities or matches its constraint year
         # almost always beats a same-topic sentence from an unrelated doc.
@@ -583,6 +775,7 @@ def _retrieve_for_fact(
             entity_score=ent_score,
             constraint_score=cons_score,
             has_target_entity=has_target or is_anchor,
+            offset=direct_support_offset,
         )
 
         candidates.append({
@@ -799,6 +992,98 @@ def _candidates_for_llm(
     return pool
 
 
+def _soft_expand_for_fact(
+    *,
+    qitem: dict,
+    parent_results: Dict[str, "FactRetrieval"],
+    searcher: BM25Searcher,
+    seen_titles: set,
+    docs: List[Tuple[str, str, List[str]]],
+    claim_kw: str,
+    k_query: int = 6,
+    max_new: int = 5,
+    enable_title_anchor: bool = True,
+    k_title_anchor: int = 3,
+) -> int:
+    """Pull docs hinted at by the *parents'* top evidence (Option A).
+
+    Run *before* per-fact retrieval. For every parent in ``qitem.rely_on``,
+    take the top direct-support's bare title and the entities mentioned
+    in its sentence; concatenate them with the current fact's text and
+    issue an extra BM25 query. The title-bare and the parent's surfaces
+    are also issued as title-only queries (Option B applied at the
+    expansion step) to make sure the answer-entity wiki page enters the
+    pool even when content-side BM25 misses it.
+
+    This is the "soft binding" path — unlike ``_bm25_followup_for_var``
+    it does not require a successful binding write, so it fires on every
+    multi-hop fact regardless of binding outcome. Returns the number of
+    new docs added.
+    """
+    rely_on = qitem.get("rely_on") or []
+    if not rely_on:
+        return 0
+
+    parent_titles: List[str] = []
+    parent_entities: List[str] = []
+    for parent_id in rely_on:
+        parent = parent_results.get(parent_id)
+        if parent is None:
+            continue
+        pool = parent.direct_supports or parent.candidates[:2]
+        for cand in pool[:2]:
+            bare = _title_bare(cand.get("title", "")) or cand.get("title", "")
+            if bare and bare not in parent_titles:
+                parent_titles.append(bare)
+            for ent in (cand.get("entities") or [])[:3]:
+                if ent and ent not in parent_entities and ent not in parent_titles:
+                    parent_entities.append(ent)
+    if not parent_titles and not parent_entities:
+        return 0
+
+    fact_only = _fact_search_text(qitem, bindings={})
+    expansion = " ".join(parent_titles[:3] + parent_entities[:5])
+    query = f"{fact_only} {expansion}".strip()
+    if claim_kw:
+        query = f"{query} {claim_kw}".strip()
+
+    added = 0
+    for title, _score, contents in searcher.search(query, k=k_query):
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+        docs.append((title, contents, ["soft_followup"]))
+        added += 1
+        if added >= max_new:
+            break
+
+    # Title-only sweep against the parent's bare titles — usually the
+    # cheapest way to pull the answer-entity page when its content body
+    # has weak claim overlap.
+    if (
+        enable_title_anchor
+        and added < max_new
+        and hasattr(searcher, "search_title")
+    ):
+        for surface in (parent_titles[:2] + parent_entities[:3]):
+            if not isinstance(surface, str) or len(surface) < 3:
+                continue
+            for title, _score, contents in searcher.search_title(
+                surface, k=k_title_anchor
+            ):
+                if title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                docs.append((title, contents, ["soft_followup_title"]))
+                added += 1
+                if added >= max_new:
+                    break
+            if added >= max_new:
+                break
+
+    return added
+
+
 def _bm25_followup_for_var(
     *,
     searcher: BM25Searcher,
@@ -876,6 +1161,74 @@ class RetrievalConfig:
     # How many candidates to show the LLM.
     llm_binding_top_k: int = 5
 
+    # ---- Option D + E (binding): gate binding by claim/fact structure ----
+    # D: only run binding propagation on multi-hop claims. 2-hop chains
+    # don't benefit because the dependency is single-step — at 200 claims
+    # the LLM-binding run lost 3.5 pp acc on hop=2 while gaining 3.8 pp
+    # on hop=4. Default 3 enables binding for hop >= 3.
+    min_hops_for_binding: int = 3
+    # E (binding): only allow binding on facts that already depend on a
+    # parent (``rely_on`` non-empty). Root facts (f1 etc.) have no upstream
+    # chain to leverage; binding them mostly produces noise that propagates
+    # downstream. Default True.
+    require_rely_on_for_binding: bool = True
+
+    # ---- Option B: title-only anchor channel ----
+    # Issue title-only BM25 against each fact's anchor surfaces during the
+    # role-aware gather. Multi-hop chains almost always need to reach a
+    # wiki page whose title literally names the target entity, and the
+    # baseline mixed-field BM25 frequently misses those pages because the
+    # contents have weak claim overlap. Diagnostic showed pool_miss at
+    # 96% on hop=4 — title-anchor directly attacks it.
+    enable_title_anchor: bool = True
+    k_title_anchor: int = 3
+    title_anchor_boost: float = 1.5
+
+    # ---- Option E (recall): dynamic budgets ----
+    # E.1 — facts with ``rely_on`` chain depth >= ``chain_depth_for_boost``
+    # get their k_fact / k_critical multiplied by ``chain_boost_factor``.
+    chain_depth_for_boost: int = 2
+    chain_boost_factor: float = 1.5
+    # E.2 — overall pool capacity scales linearly with ``num_hops``:
+    #   effective_max_docs = max_docs + max(0, num_hops - 2) * max_docs_per_extra_hop
+    # 4-hop claims have ~5 facts and need a wider pool to host all
+    # answer-entity pages plus the anchoring topical pages.
+    max_docs_per_extra_hop: int = 10
+
+    # ---- Option A: forced soft expansion ----
+    # Before retrieving evidence for fact F, fan out from its parents'
+    # top direct supports — take (title_bare, top entities) and issue an
+    # extra BM25 query plus a title-only sweep. Runs regardless of
+    # binding success so the deep-chain answer doc enters the pool even
+    # when the binding stage cannot resolve the parent's answer slot.
+    enable_soft_expand: bool = True
+    soft_expand_k_query: int = 6
+    soft_expand_max_new: int = 5
+
+    # ---- Option C: cross-encoder reranker ----
+    # When ``reranker_blend > 0`` and a ``CrossEncoderReranker`` is passed
+    # into ``retrieve_for_claim``, the per-fact loop batch-scores up to
+    # ``reranker_max_candidates`` sentences against the fact's query and
+    # blends the result into ``ce_score`` (gate) and ``composite_score``
+    # (ranking) — see ``_retrieve_for_fact``. Default 0.5 = equal vote
+    # with the heuristic; raise to 0.7 to lean on the reranker more once
+    # thresholds have been retuned. Diagnostic showed A+B+E migrated
+    # ~9 claims from pool_miss to ranking_miss; C aims to convert them
+    # to full_hit by using a stronger relevance signal.
+    reranker_blend: float = 0.5
+    reranker_max_candidates: int = 60
+
+    # ---- C.1: direct_support gate retune ----
+    # Constant added to every ``ce_score`` threshold inside
+    # ``_direct_support_pass``. The reranker bumps mean ce_score from
+    # ~0.51 to ~0.64 in our 200-claim benchmark; without a matching
+    # threshold shift the gate admits ~2.7x more marginal sentences and
+    # the resulting fat ``evidence_per_fact`` confuses the LLM (hop=3
+    # support TPs dropped 14 → 8 across preS1S2 → ABCE before this
+    # offset). Default 0.0 keeps the legacy gate when the reranker is
+    # off; set to ~0.10 when ``reranker_blend > 0``.
+    direct_support_offset: float = 0.0
+
 
 def retrieve_for_claim(
     claim: str,
@@ -886,6 +1239,8 @@ def retrieve_for_claim(
     config: RetrievalConfig | None = None,
     initial_bindings: Optional[Dict[str, str]] = None,
     llm_binding_fn: Optional[LLMBindingFn] = None,
+    num_hops: Optional[int] = None,
+    reranker: Optional[CrossEncoderReranker] = None,
 ) -> Dict[str, object]:
     """Run the full GraphRAG retrieval for one claim.
 
@@ -903,6 +1258,16 @@ def retrieve_for_claim(
     config = config or RetrievalConfig()
     bindings = dict(initial_bindings or {})
 
+    # Option E.1: precompute chain depths so deep-leaf facts get a bigger
+    # BM25 budget. Option E.2: scale total pool capacity by num_hops.
+    chain_depths = _fact_chain_depths(question_items)
+    effective_max_docs = config.max_docs
+    if num_hops is not None and config.max_docs_per_extra_hop > 0:
+        effective_max_docs = (
+            config.max_docs
+            + max(0, num_hops - 2) * config.max_docs_per_extra_hop
+        )
+
     # 1) BM25 doc gather ----------------------------------------------------
     docs = _gather_candidate_docs(
         searcher=searcher,
@@ -912,7 +1277,13 @@ def retrieve_for_claim(
         k_fact=config.k_fact,
         k_critical=config.k_critical,
         k_constraint=config.k_constraint,
-        max_docs=config.max_docs,
+        max_docs=effective_max_docs,
+        chain_depths=chain_depths,
+        chain_depth_for_boost=config.chain_depth_for_boost,
+        chain_boost_factor=config.chain_boost_factor,
+        k_title_anchor=config.k_title_anchor,
+        title_anchor_boost=config.title_anchor_boost,
+        enable_title_anchor=config.enable_title_anchor,
     )
     if not docs:
         return {
@@ -944,7 +1315,31 @@ def retrieve_for_claim(
     graph_dirty = False
     binding_trace: List[Dict[str, str]] = []
     followup_added_total = 0
+    soft_expand_added_total = 0
     for i, qitem in enumerate(ordered):
+        # Option A: forced soft expansion BEFORE per-fact retrieval. Use
+        # the parents' top direct supports (title_bare + entities) to
+        # augment this fact's BM25 query and pull new docs. Runs whether
+        # or not the parent's binding succeeded — that's the whole point,
+        # the binding-gated follow-up was leaving deep-chain answer docs
+        # outside the pool (96% pool_miss on hop=4 in the diagnostic).
+        if config.enable_soft_expand and qitem.get("rely_on"):
+            added_soft = _soft_expand_for_fact(
+                qitem=qitem,
+                parent_results=fact_results,
+                searcher=searcher,
+                seen_titles=seen_titles,
+                docs=docs,
+                claim_kw=claim_kw,
+                k_query=config.soft_expand_k_query,
+                max_new=config.soft_expand_max_new,
+                enable_title_anchor=config.enable_title_anchor,
+                k_title_anchor=config.k_title_anchor,
+            )
+            if added_soft > 0:
+                soft_expand_added_total += added_soft
+                graph_dirty = True
+
         if graph_dirty:
             graph = build_hetero_graph(
                 [(t, c) for t, c, _ in docs],
@@ -962,6 +1357,10 @@ def retrieve_for_claim(
             bindings=bindings,
             top_k_candidates=config.fact_top_k_candidates,
             top_k_final=config.fact_top_k_final,
+            reranker=reranker,
+            reranker_blend=config.reranker_blend,
+            reranker_max_candidates=config.reranker_max_candidates,
+            direct_support_offset=config.direct_support_offset,
         )
         fact_results[result.fact_id] = result
 
@@ -974,7 +1373,29 @@ def retrieve_for_claim(
         new_binding: Optional[Tuple[str, str]] = None
         binding_source = ""
         slot = qitem.get("answer_slot")
+
+        # Option D: skip binding on shallow claims.
+        # Option E: skip binding on root facts (no rely_on) — they have no
+        # upstream chain to leverage and binding them often poisons the
+        # downstream follow-up BM25.
+        skip_binding = False
         if (
+            num_hops is not None
+            and config.min_hops_for_binding > 0
+            and num_hops < config.min_hops_for_binding
+        ):
+            skip_binding = True
+            binding_source = f"skipped:hop<{config.min_hops_for_binding}"
+        elif (
+            config.require_rely_on_for_binding
+            and not (qitem.get("rely_on") or [])
+        ):
+            skip_binding = True
+            binding_source = "skipped:no_rely_on"
+
+        if skip_binding:
+            new_binding = None
+        elif (
             llm_binding_fn is not None
             and isinstance(slot, str)
             and slot.startswith("?")
@@ -1039,6 +1460,9 @@ def retrieve_for_claim(
             "num_entities": len(graph.entity_keys),
             "num_communities": len(set(graph.communities.values())),
             "followup_docs_added": followup_added_total,
+            "soft_expand_docs_added": soft_expand_added_total,
+            "effective_max_docs": effective_max_docs,
+            "chain_depths": chain_depths,
             "binding_trace": binding_trace,
             "final_bindings": dict(bindings),
         },
