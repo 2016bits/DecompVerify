@@ -196,6 +196,105 @@ def make_llm_binding_fn(plan: str, max_retries: int = 2, debug: bool = False):
     return _fn
 
 
+def make_leaf_cand_fn(plan: str, max_candidates: int = 3,
+                       max_retries: int = 2, debug: bool = False):
+    """Return ``(claim, qitem, bindings) -> List[str]`` for Option F1.
+
+    Asks an LLM (gpt-4o on ``azure*`` plans, DeepSeek-V3.2 elsewhere) to
+    generate up to ``max_candidates`` wiki-style title candidates for
+    the fact's answer slot. The retriever immediately title-only BM25s
+    each candidate, so even imperfect names are useful — we win as long
+    as one of the candidates is the actual gold title or a near-match.
+
+    Failure modes (LLM error, JSON parse fail, empty answer) return ``[]``.
+    """
+    client, model = _build_llm_client(plan)
+
+    def _format_bindings(b: Dict[str, str]) -> str:
+        if not b:
+            return "(none)"
+        bits = []
+        for k, v in b.items():
+            if isinstance(v, str) and v and not _is_placeholder_binding(v):
+                bits.append(f"{k} = {v}")
+        return "; ".join(bits) if bits else "(none)"
+
+    def _fn(claim: str, qitem: dict, bindings: Dict[str, str]) -> List[str]:
+        fact_text = qitem.get("fact_text", "") or ""
+        slot = qitem.get("answer_slot") or ""
+        bind_str = _format_bindings(bindings)
+        cons_str = _format_constraint(qitem)
+
+        prompt = (
+            "You are helping a fact-checking system locate the right Wikipedia "
+            "pages for unresolved entities in a multi-hop claim. For the "
+            "sub-fact below, propose Wikipedia-style entity titles that the "
+            "answer is most likely to be.\n\n"
+            f"Claim: {claim}\n\n"
+            f"Sub-fact: {fact_text}\n"
+            f"Variable to resolve: {slot or '(unspecified)'}\n"
+            f"Constraints on the answer: {cons_str}\n"
+            f"Resolved bindings from parent sub-facts: {bind_str}\n\n"
+            "Rules:\n"
+            "- Each candidate must be a named entity / proper noun.\n"
+            "- Give the bare Wikipedia title (e.g. \"Gaddafi Stadium\", "
+            "\"Scorpion\", \"Karl Kraepelin\"), NOT a description.\n"
+            "- Prefer specific over generic (\"Scorpion\" beats \"Arachnid\").\n"
+            "- If uncertain between near-synonyms, list both.\n"
+            f"- Give at most {max_candidates} candidates; you may give fewer.\n\n"
+            "Respond with ONLY a JSON object on one line, no fences:\n"
+            '{"candidates": ["TitleA", "TitleB", "TitleC"]}'
+        )
+
+        last_err = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=160,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                content = _JSON_FENCE_RE.sub("", content).strip()
+                m = re.search(r"\{[^{}]*\}", content)
+                if m:
+                    content = m.group(0)
+                parsed = json.loads(content)
+                cands = parsed.get("candidates") or []
+                out: List[str] = []
+                seen: set = set()
+                for c in cands:
+                    if not isinstance(c, str):
+                        continue
+                    c = c.strip().strip(".,;:")
+                    if not c or len(c) < 3:
+                        continue
+                    key = c.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(c)
+                    if len(out) >= max_candidates:
+                        break
+                if debug:
+                    print(f"[leaf_cand] {qitem.get('fact_id')} -> {out}",
+                          flush=True)
+                return out
+            except Exception as exc:
+                last_err = exc
+                if attempt < max_retries:
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                if debug:
+                    print(f"[leaf_cand] error {qitem.get('fact_id')}: "
+                          f"{type(exc).__name__}: {exc}", flush=True)
+                return []
+        return []
+
+    return _fn
+
+
 def _extract_initial_bindings(decomposition: dict) -> Dict[str, str]:
     bindings: Dict[str, str] = {}
     for slot, info in (decomposition.get("entity_slots", {}) or {}).items():
@@ -215,6 +314,7 @@ def process_one(
     config: RetrievalConfig,
     llm_binding_fn: Optional[Callable] = None,
     reranker: Optional[CrossEncoderReranker] = None,
+    leaf_cand_fn: Optional[Callable] = None,
 ) -> dict:
     claim = item.get("claim", "")
     question_plan = item.get("question_plan") or {}
@@ -233,6 +333,7 @@ def process_one(
             llm_binding_fn=llm_binding_fn,
             num_hops=item.get("num_hops"),
             reranker=reranker,
+            leaf_cand_fn=leaf_cand_fn,
         )
     except Exception as exc:  # pragma: no cover - defensive
         result = {
@@ -360,6 +461,9 @@ def main(args):
         reranker_blend=args.reranker_blend,
         reranker_max_candidates=args.reranker_max_candidates,
         direct_support_offset=args.direct_support_offset,
+        # Option F1
+        leaf_cand_min_depth=args.leaf_cand_min_depth,
+        leaf_cand_max_new_docs=args.leaf_cand_max_new_docs,
     )
 
     # Option C: load the cross-encoder reranker (lazy — no-op if disabled).
@@ -388,8 +492,21 @@ def main(args):
         llm_binding_fn = make_llm_binding_fn(
             plan=args.plan, debug=bool(args.llm_binding_debug))
 
+    leaf_cand_fn = None
+    if args.use_leaf_cand:
+        print(f"[retrieve_evidence] enabling Option F1 leaf-candidate gen "
+              f"(deepest_leaf_only=True, min_depth={args.leaf_cand_min_depth}, "
+              f"max_candidates={args.leaf_cand_max_candidates}, "
+              f"max_new_docs={args.leaf_cand_max_new_docs})", flush=True)
+        leaf_cand_fn = make_leaf_cand_fn(
+            plan=args.plan,
+            max_candidates=args.leaf_cand_max_candidates,
+            debug=bool(args.leaf_cand_debug),
+        )
+
     fn = partial(process_one, searcher=searcher, encoder=encoder, config=config,
-                 llm_binding_fn=llm_binding_fn, reranker=reranker)
+                 llm_binding_fn=llm_binding_fn, reranker=reranker,
+                 leaf_cand_fn=leaf_cand_fn)
 
     results: List[dict] = []
     start_time = time.time()
@@ -549,5 +666,22 @@ if __name__ == "__main__":
                              "threshold in _direct_support_pass. Use ~0.10 "
                              "when reranker is enabled to match its higher "
                              "ce_score mean. 0.0 = legacy gate.")
+
+    # Option F1: LLM leaf-candidate answer generation
+    parser.add_argument("--use_leaf_cand", action="store_true",
+                        help="(Option F1) For each deepest leaf fact whose "
+                             "chain depth is >= leaf_cand_min_depth, ask the "
+                             "LLM to propose wiki title candidates, then "
+                             "title-only BM25 each. Routes through the same "
+                             "plan client.")
+    parser.add_argument("--leaf_cand_min_depth", type=int, default=2,
+                        help="(Option F1) minimum chain depth for firing on "
+                             "a deepest leaf fact. 2 skips shallow chains.")
+    parser.add_argument("--leaf_cand_max_candidates", type=int, default=3,
+                        help="(Option F1) max candidates the LLM may return.")
+    parser.add_argument("--leaf_cand_max_new_docs", type=int, default=8,
+                        help="(Option F1) cap on new docs added per leaf.")
+    parser.add_argument("--leaf_cand_debug", action="store_true",
+                        help="(Option F1) verbose logging.")
 
     main(parser.parse_args())

@@ -41,6 +41,14 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 LLMBindingFn = Callable[[dict, List[dict], Dict[str, str]],
                         Optional[Tuple[str, str]]]
 
+# Type alias for the optional leaf-candidate-generator hook (Option F1).
+# Caller builds a closure that takes ``(claim, qitem, current_bindings)``
+# and returns up to ``k`` wiki-title candidates for the fact's answer
+# slot. Used to drag the leaf answer doc into the pool when neither the
+# claim nor the resolved bindings spell the title out (e.g. "Scorpion",
+# "Gaddafi Stadium" — answers that hop=3/4 BM25 never finds).
+LeafCandFn = Callable[[str, dict, Dict[str, str]], List[str]]
+
 import numpy as np
 
 from .bm25_index import BM25Searcher
@@ -159,6 +167,30 @@ def _fact_chain_depths(question_items: Sequence[dict]) -> Dict[str, int]:
     for fid in by_id:
         _d(fid, set())
     return cache
+
+
+def _deepest_leaf_fact_ids(
+    question_items: Sequence[dict],
+    chain_depths: Dict[str, int],
+) -> set:
+    """Return fact IDs that are both leaf nodes and at the max chain depth."""
+    by_id = {q.get("fact_id"): q for q in question_items if q.get("fact_id")}
+    if not by_id:
+        return set()
+
+    has_child = {fid: False for fid in by_id}
+    for q in by_id.values():
+        for parent_id in q.get("rely_on", []) or []:
+            if parent_id in has_child:
+                has_child[parent_id] = True
+
+    max_depth = max((chain_depths.get(fid, 0) for fid in by_id), default=0)
+    return {
+        fid
+        for fid in by_id
+        if not has_child.get(fid, False)
+        and chain_depths.get(fid, 0) == max_depth
+    }
 
 
 def _fact_anchor_surfaces(qitem: dict) -> List[str]:
@@ -1084,6 +1116,64 @@ def _soft_expand_for_fact(
     return added
 
 
+def _apply_leaf_candidates(
+    *,
+    claim: str,
+    qitem: dict,
+    bindings: Dict[str, str],
+    leaf_cand_fn: LeafCandFn,
+    searcher: BM25Searcher,
+    seen_titles: set,
+    docs: List[Tuple[str, str, List[str]]],
+    k_title_anchor: int = 3,
+    max_new: int = 8,
+) -> Tuple[int, List[str]]:
+    """Option F1 — pull leaf answer-entity wiki pages into the pool.
+
+    For deep-chain facts (typically leaves), call an external LLM closure
+    to *generate* up to 3 candidate Wikipedia-style titles for the fact's
+    answer slot. Each candidate is then issued as a title-only BM25 query
+    (Option B's machinery) so the resulting wiki pages join the candidate
+    pool. This attacks the dominant residual failure mode after A+B+C+E:
+    the leaf answer doc whose name is *not literally* in the claim text
+    (e.g. "Scorpion", "Gaddafi Stadium") and therefore cannot be reached
+    by either the original BM25 sweep or the parent-bound soft expansion.
+
+    Returns ``(num_new_docs_added, candidates_attempted)``.
+    """
+    try:
+        candidates = leaf_cand_fn(claim, qitem, bindings) or []
+    except Exception as exc:
+        return 0, [f"<err:{type(exc).__name__}>"]
+    if not candidates:
+        return 0, []
+
+    added = 0
+    accepted_cands: List[str] = []
+    for cand in candidates:
+        if not isinstance(cand, str):
+            continue
+        cand = cand.strip().strip(".,;:")
+        if len(cand) < 3:
+            continue
+        accepted_cands.append(cand)
+        # Title-only sweep — these queries are extremely cheap and the
+        # ones that miss simply contribute nothing.
+        if hasattr(searcher, "search_title"):
+            hits = searcher.search_title(cand, k=k_title_anchor)
+        else:
+            hits = searcher.search(cand, k=k_title_anchor)
+        for title, _score, contents in hits:
+            if title in seen_titles:
+                continue
+            seen_titles.add(title)
+            docs.append((title, contents, ["leaf_cand"]))
+            added += 1
+            if added >= max_new:
+                return added, accepted_cands
+    return added, accepted_cands
+
+
 def _bm25_followup_for_var(
     *,
     searcher: BM25Searcher,
@@ -1229,6 +1319,15 @@ class RetrievalConfig:
     # off; set to ~0.10 when ``reranker_blend > 0``.
     direct_support_offset: float = 0.0
 
+    # ---- Option F1: LLM leaf-candidate answer generation ----
+    # For each deepest leaf fact, ask an external LLM closure to generate
+    # candidate wiki titles for the fact's answer slot, then title-only
+    # BM25 each candidate. ``leaf_cand_min_depth`` remains as a cost gate:
+    # default depth = 2 catches hop=3 leaves and hop=4 bottom facts while
+    # skipping shallow chains.
+    leaf_cand_min_depth: int = 2
+    leaf_cand_max_new_docs: int = 8
+
 
 def retrieve_for_claim(
     claim: str,
@@ -1241,6 +1340,7 @@ def retrieve_for_claim(
     llm_binding_fn: Optional[LLMBindingFn] = None,
     num_hops: Optional[int] = None,
     reranker: Optional[CrossEncoderReranker] = None,
+    leaf_cand_fn: Optional[LeafCandFn] = None,
 ) -> Dict[str, object]:
     """Run the full GraphRAG retrieval for one claim.
 
@@ -1261,6 +1361,7 @@ def retrieve_for_claim(
     # Option E.1: precompute chain depths so deep-leaf facts get a bigger
     # BM25 budget. Option E.2: scale total pool capacity by num_hops.
     chain_depths = _fact_chain_depths(question_items)
+    deepest_leaf_ids = _deepest_leaf_fact_ids(question_items, chain_depths)
     effective_max_docs = config.max_docs
     if num_hops is not None and config.max_docs_per_extra_hop > 0:
         effective_max_docs = (
@@ -1316,6 +1417,8 @@ def retrieve_for_claim(
     binding_trace: List[Dict[str, str]] = []
     followup_added_total = 0
     soft_expand_added_total = 0
+    leaf_cand_added_total = 0
+    leaf_cand_trace: List[Dict[str, object]] = []
     for i, qitem in enumerate(ordered):
         # Option A: forced soft expansion BEFORE per-fact retrieval. Use
         # the parents' top direct supports (title_bare + entities) to
@@ -1338,6 +1441,39 @@ def retrieve_for_claim(
             )
             if added_soft > 0:
                 soft_expand_added_total += added_soft
+                graph_dirty = True
+
+        # Option F1: LLM-generated leaf candidates. This fires only for
+        # facts that are leaf nodes at the deepest rely_on chain depth for
+        # this claim, with ``leaf_cand_min_depth`` as a shallow-chain cost
+        # gate. The closure may be slow (one extra LLM call per qualifying
+        # fact), so it is gated by ``leaf_cand_fn is not None``.
+        fid_curr = qitem.get("fact_id", "")
+        depth_curr = chain_depths.get(fid_curr, 0)
+        if (
+            leaf_cand_fn is not None
+            and fid_curr in deepest_leaf_ids
+            and depth_curr >= config.leaf_cand_min_depth
+        ):
+            added_lc, cand_attempted = _apply_leaf_candidates(
+                claim=claim,
+                qitem=qitem,
+                bindings=bindings,
+                leaf_cand_fn=leaf_cand_fn,
+                searcher=searcher,
+                seen_titles=seen_titles,
+                docs=docs,
+                k_title_anchor=config.k_title_anchor,
+                max_new=config.leaf_cand_max_new_docs,
+            )
+            leaf_cand_trace.append({
+                "fact_id": fid_curr,
+                "depth": depth_curr,
+                "candidates": cand_attempted,
+                "new_docs": added_lc,
+            })
+            if added_lc > 0:
+                leaf_cand_added_total += added_lc
                 graph_dirty = True
 
         if graph_dirty:
@@ -1461,8 +1597,11 @@ def retrieve_for_claim(
             "num_communities": len(set(graph.communities.values())),
             "followup_docs_added": followup_added_total,
             "soft_expand_docs_added": soft_expand_added_total,
+            "leaf_cand_docs_added": leaf_cand_added_total,
+            "leaf_cand_trace": leaf_cand_trace,
             "effective_max_docs": effective_max_docs,
             "chain_depths": chain_depths,
+            "deepest_leaf_fact_ids": sorted(deepest_leaf_ids),
             "binding_trace": binding_trace,
             "final_bindings": dict(bindings),
         },
