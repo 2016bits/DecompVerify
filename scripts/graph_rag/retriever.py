@@ -279,6 +279,48 @@ def _fact_search_text(qitem: dict, bindings: Dict[str, str]) -> str:
     return f"{base} {hints}".strip()
 
 
+def _vars_in_obj(obj) -> set:
+    if isinstance(obj, str):
+        return set(VAR_PATTERN.findall(obj))
+    if isinstance(obj, list):
+        out = set()
+        for item in obj:
+            out.update(_vars_in_obj(item))
+        return out
+    if isinstance(obj, dict):
+        out = set()
+        for value in obj.values():
+            out.update(_vars_in_obj(value))
+        return out
+    return set()
+
+
+def _has_resolved_binding(bindings: Dict[str, str], var: str) -> bool:
+    value = bindings.get(var)
+    return isinstance(value, str) and bool(value.strip()) and not _is_placeholder_binding(value)
+
+
+def _unresolved_vars_for_fact(qitem: dict, bindings: Dict[str, str]) -> List[str]:
+    vars_seen = set()
+    for key in ("fact_text", "main_question", "search_hints", "constraint"):
+        vars_seen.update(_vars_in_obj(qitem.get(key)))
+    return sorted(var for var in vars_seen if not _has_resolved_binding(bindings, var))
+
+
+def _answer_slot_consumers(question_items: Sequence[dict]) -> Dict[str, List[str]]:
+    """Return answer slot -> fact IDs that consume it."""
+    consumers: Dict[str, List[str]] = {}
+    for q in question_items:
+        fid = q.get("fact_id", "")
+        slot = q.get("answer_slot", "")
+        consumed = _unresolved_vars_for_fact(q, bindings={})
+        if isinstance(slot, str) and slot.startswith("?"):
+            consumed = [var for var in consumed if var != slot]
+        for var in consumed:
+            consumers.setdefault(var, []).append(fid)
+    return consumers
+
+
 def _constraint_query(qitem: dict) -> Optional[str]:
     cons = qitem.get("constraint") or {}
     bits: List[str] = []
@@ -1328,6 +1370,18 @@ class RetrievalConfig:
     leaf_cand_min_depth: int = 2
     leaf_cand_max_new_docs: int = 8
 
+    # ---- First-batch long-hop experiment: unresolved-variable triggers ----
+    # If a root fact produces an answer_slot that downstream facts consume,
+    # allow binding even when ``require_rely_on_for_binding`` is True. This
+    # fixes decompositions where the producer fact is correctly identified but
+    # the LLM left later facts with empty ``rely_on``.
+    unresolved_binding_override: bool = True
+    # Fire leaf-candidate generation not only on deepest leaves, but also on
+    # facts that still contain unresolved variables or produce an unresolved
+    # slot used downstream. Cost is bounded by ``use_leaf_cand`` and the
+    # existing hop/depth gates in the runner.
+    unresolved_leaf_cand: bool = True
+
 
 def retrieve_for_claim(
     claim: str,
@@ -1362,6 +1416,7 @@ def retrieve_for_claim(
     # BM25 budget. Option E.2: scale total pool capacity by num_hops.
     chain_depths = _fact_chain_depths(question_items)
     deepest_leaf_ids = _deepest_leaf_fact_ids(question_items, chain_depths)
+    slot_consumers = _answer_slot_consumers(question_items)
     effective_max_docs = config.max_docs
     if num_hops is not None and config.max_docs_per_extra_hop > 0:
         effective_max_docs = (
@@ -1450,10 +1505,26 @@ def retrieve_for_claim(
         # fact), so it is gated by ``leaf_cand_fn is not None``.
         fid_curr = qitem.get("fact_id", "")
         depth_curr = chain_depths.get(fid_curr, 0)
+        unresolved_vars = _unresolved_vars_for_fact(qitem, bindings)
+        slot_curr = qitem.get("answer_slot")
+        slot_consumed_downstream = (
+            isinstance(slot_curr, str)
+            and slot_curr.startswith("?")
+            and bool(slot_consumers.get(slot_curr))
+            and not _has_resolved_binding(bindings, slot_curr)
+        )
+        is_deepest_leaf = (
+            fid_curr in deepest_leaf_ids
+            and depth_curr >= config.leaf_cand_min_depth
+        )
+        unresolved_leaf_trigger = (
+            config.unresolved_leaf_cand
+            and (num_hops is None or num_hops >= config.min_hops_for_binding)
+            and (bool(unresolved_vars) or slot_consumed_downstream)
+        )
         if (
             leaf_cand_fn is not None
-            and fid_curr in deepest_leaf_ids
-            and depth_curr >= config.leaf_cand_min_depth
+            and (is_deepest_leaf or unresolved_leaf_trigger)
         ):
             added_lc, cand_attempted = _apply_leaf_candidates(
                 claim=claim,
@@ -1469,6 +1540,11 @@ def retrieve_for_claim(
             leaf_cand_trace.append({
                 "fact_id": fid_curr,
                 "depth": depth_curr,
+                "trigger": (
+                    "deepest_leaf" if is_deepest_leaf else "unresolved_var"
+                ),
+                "unresolved_vars": unresolved_vars,
+                "slot_consumed_downstream": slot_consumed_downstream,
                 "candidates": cand_attempted,
                 "new_docs": added_lc,
             })
@@ -1525,6 +1601,10 @@ def retrieve_for_claim(
         elif (
             config.require_rely_on_for_binding
             and not (qitem.get("rely_on") or [])
+            and not (
+                config.unresolved_binding_override
+                and slot_consumed_downstream
+            )
         ):
             skip_binding = True
             binding_source = "skipped:no_rely_on"
@@ -1602,6 +1682,7 @@ def retrieve_for_claim(
             "effective_max_docs": effective_max_docs,
             "chain_depths": chain_depths,
             "deepest_leaf_fact_ids": sorted(deepest_leaf_ids),
+            "answer_slot_consumers": slot_consumers,
             "binding_trace": binding_trace,
             "final_bindings": dict(bindings),
         },

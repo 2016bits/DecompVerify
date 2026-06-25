@@ -40,6 +40,7 @@ from graph_rag.retriever import (
     _is_placeholder_binding,
     retrieve_for_claim,
 )
+from dependency_repair import VAR_PATTERN, repair_item_dependencies
 
 
 # --------------------------------------------------------------------------- LLM-assisted binding
@@ -301,8 +302,15 @@ def _extract_initial_bindings(decomposition: dict) -> Dict[str, str]:
         if not isinstance(info, dict):
             continue
         value = info.get("value")
-        if isinstance(value, str) and value.strip():
-            bindings[slot] = value.strip()
+        if not isinstance(value, str) or not value.strip():
+            continue
+        value = value.strip()
+        # Descriptions such as "a Catalan football club" should remain
+        # unresolved so retrieval can bind them from evidence instead of
+        # substituting prose into downstream queries.
+        if VAR_PATTERN.search(value) or _is_placeholder_binding(value):
+            continue
+        bindings[slot] = value
     return bindings
 
 
@@ -315,7 +323,12 @@ def process_one(
     llm_binding_fn: Optional[Callable] = None,
     reranker: Optional[CrossEncoderReranker] = None,
     leaf_cand_fn: Optional[Callable] = None,
+    dependency_repair: bool = False,
 ) -> dict:
+    repair_summary = None
+    if dependency_repair:
+        item, repair_summary = repair_item_dependencies(item)
+
     claim = item.get("claim", "")
     question_plan = item.get("question_plan") or {}
     question_items = question_plan.get("question_items", []) or []
@@ -394,6 +407,8 @@ def process_one(
             for fr in result.get("fact_results", [])
         ],
     }
+    if repair_summary is not None:
+        out["retrieval_meta"]["dependency_repair"] = repair_summary
     return out
 
 
@@ -464,6 +479,8 @@ def main(args):
         # Option F1
         leaf_cand_min_depth=args.leaf_cand_min_depth,
         leaf_cand_max_new_docs=args.leaf_cand_max_new_docs,
+        unresolved_binding_override=not args.no_unresolved_binding_override,
+        unresolved_leaf_cand=not args.no_unresolved_leaf_cand,
     )
 
     # Option C: load the cross-encoder reranker (lazy — no-op if disabled).
@@ -506,7 +523,8 @@ def main(args):
 
     fn = partial(process_one, searcher=searcher, encoder=encoder, config=config,
                  llm_binding_fn=llm_binding_fn, reranker=reranker,
-                 leaf_cand_fn=leaf_cand_fn)
+                 leaf_cand_fn=leaf_cand_fn,
+                 dependency_repair=bool(args.dependency_repair))
 
     results: List[dict] = []
     start_time = time.time()
@@ -683,5 +701,18 @@ if __name__ == "__main__":
                         help="(Option F1) cap on new docs added per leaf.")
     parser.add_argument("--leaf_cand_debug", action="store_true",
                         help="(Option F1) verbose logging.")
+
+    # First-batch long-hop experiment: deterministic dependency repair plus
+    # unresolved-variable retrieval triggers.
+    parser.add_argument("--dependency_repair", action="store_true",
+                        help="Repair missing rely_on edges by linking facts "
+                             "that consume a variable to the fact whose "
+                             "answer_slot produces it.")
+    parser.add_argument("--no_unresolved_binding_override", action="store_true",
+                        help="Disable root binding for unresolved answer slots "
+                             "that are consumed downstream.")
+    parser.add_argument("--no_unresolved_leaf_cand", action="store_true",
+                        help="Disable leaf-candidate generation for facts with "
+                             "unresolved variables.")
 
     main(parser.parse_args())
